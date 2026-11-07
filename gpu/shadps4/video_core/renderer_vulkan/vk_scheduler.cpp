@@ -19,8 +19,41 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
+namespace {
+constexpr u32 GpuTimestampSlots = 4096;
+constexpr u32 GpuTimestampQueriesPerSlot = 2;
+constexpr u32 NoGpuTimestamp = UINT32_MAX;
+} // namespace
+
 Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    if (SotcStats::kGpuTimestamps) {
+        const auto properties = instance.GetPhysicalDevice().getProperties();
+        const auto families = instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const u32 family = instance.GetGraphicsQueueFamilyIndex();
+        if (!properties.limits.timestampComputeAndGraphics || family >= families.size() ||
+            families[family].timestampValidBits == 0 || properties.limits.timestampPeriod <= 0.0f) {
+            std::fprintf(stderr, "SOTC GPU TIMESTAMPS unavailable on the selected graphics queue\n");
+        } else {
+            const vk::QueryPoolCreateInfo query_info{
+                .queryType = vk::QueryType::eTimestamp,
+                .queryCount = GpuTimestampSlots * GpuTimestampQueriesPerSlot,
+            };
+            auto [result, pool] = instance.GetDevice().createQueryPoolUnique(query_info);
+            if (result == vk::Result::eSuccess) {
+                gpu_timestamp_pool = std::move(pool);
+                gpu_timestamp_valid_bits = families[family].timestampValidBits;
+                gpu_timestamp_period_ns = properties.limits.timestampPeriod;
+                std::fprintf(stderr,
+                             "SOTC GPU TIMESTAMPS enabled: period %.3f ns, valid bits %u, "
+                             "nonblocking slots %u\n",
+                             gpu_timestamp_period_ns, gpu_timestamp_valid_bits, GpuTimestampSlots);
+            } else {
+                std::fprintf(stderr, "SOTC GPU TIMESTAMPS query pool creation failed: %s\n",
+                             vk::to_string(result).c_str());
+            }
+        }
+    }
     if (record_thread) {
         recorder = std::make_unique<CommandRecorder>();
         LOG_INFO(Render_Vulkan, "Vulkan commands are recorded on their own thread");
@@ -341,6 +374,9 @@ void Scheduler::PopPendingOperations() {
 
 void Scheduler::BeginSession() {
     EndSession();
+    if (gpu_timestamp_pool) {
+        HarvestGpuTimings();
+    }
 
     auto& session = sessions.emplace_back();
 
@@ -353,6 +389,20 @@ void Scheduler::BeginSession() {
         };
         session.primary = command_pool.Commit();
         Check(session.primary.begin(begin_info));
+    }
+
+    if (gpu_timestamp_pool) {
+        if (gpu_timestamp_pending < GpuTimestampSlots) {
+            const u32 slot = (gpu_timestamp_head + gpu_timestamp_pending) % GpuTimestampSlots;
+            session.gpu_query_base = slot * GpuTimestampQueriesPerSlot;
+            ++gpu_timestamp_pending;
+            session.primary.resetQueryPool(*gpu_timestamp_pool, session.gpu_query_base,
+                                           GpuTimestampQueriesPerSlot);
+            session.primary.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe,
+                                           *gpu_timestamp_pool, session.gpu_query_base);
+        } else {
+            SotcStats::gpu_timestamp_skipped.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
@@ -377,13 +427,47 @@ void Scheduler::EndSession() {
         on_session();
     }
 
-    const auto& session = sessions.back();
+    auto& session = sessions.back();
     if (session.upload) {
         Check(session.upload.end());
     }
 
+    if (session.gpu_query_base != NoGpuTimestamp) {
+        session.primary.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+                                       *gpu_timestamp_pool,
+                                       session.gpu_query_base + 1);
+    }
+
     EndRendering();
     Check(session.primary.end());
+}
+
+void Scheduler::HarvestGpuTimings() {
+    if (!gpu_timestamp_pool || gpu_timestamp_pending == 0) {
+        return;
+    }
+    const vk::QueryResultFlags flags = vk::QueryResultFlagBits::e64 |
+                                       vk::QueryResultFlagBits::eWithAvailability;
+    const u32 valid_bits = gpu_timestamp_valid_bits;
+    const u64 mask = valid_bits >= 64 ? UINT64_MAX : ((u64{1} << valid_bits) - 1);
+    const vk::Device device = instance.GetDevice();
+    // Poll a small prefix only. Never wait for the GPU or allocate on the frame path.
+    for (u32 polled = 0; polled < 16 && gpu_timestamp_pending != 0; ++polled) {
+        const u32 query = gpu_timestamp_head * GpuTimestampQueriesPerSlot;
+        std::array<u64, 4> result{};
+        const vk::Result status = device.getQueryPoolResults(
+            *gpu_timestamp_pool, query, GpuTimestampQueriesPerSlot, sizeof(result), result.data(),
+            sizeof(u64) * 2, flags);
+        if (status != vk::Result::eSuccess || result[1] == 0 || result[3] == 0) {
+            break;
+        }
+        const u64 ticks = (result[2] - result[0]) & mask;
+        const u64 elapsed_ns = static_cast<u64>(double(ticks) * gpu_timestamp_period_ns);
+        SotcStats::gpu_timestamp_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+        SotcStats::gpu_timestamp_samples.fetch_add(1, std::memory_order_relaxed);
+        gpu_timestamp_head = (gpu_timestamp_head + 1) % GpuTimestampSlots;
+        --gpu_timestamp_pending;
+    }
 }
 
 // The queue submit of SubmitExecution, from the command processor or the recording thread.
@@ -417,9 +501,17 @@ static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    std::scoped_lock lk{Scheduler::submit_mutex};
+    std::unique_lock<std::mutex> lk;
+    {
+        const SotcStats::SplitTimer submit_lock{SotcStats::SplitSubmitLock, false};
+        lk = std::unique_lock<std::mutex>{Scheduler::submit_mutex};
+    }
     ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    vk::Result submit_result;
+    {
+        const SotcStats::SplitTimer queue_submit{SotcStats::SplitVkQueueSubmit, false};
+        submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    }
     if (submit_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault();
         UNREACHABLE_MSG("Device lost during submit");

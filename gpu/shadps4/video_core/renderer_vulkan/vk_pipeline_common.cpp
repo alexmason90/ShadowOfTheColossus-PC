@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_stats.h"
 
 namespace Vulkan {
 
@@ -34,6 +35,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     }
 
     if (uses_push_descriptors) {
+        const SotcStats::SplitTimer descriptor_push{SotcStats::SplitDescPush};
         cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
         return;
     }
@@ -42,7 +44,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
+    {
+        const SotcStats::SplitTimer descriptor_update{SotcStats::SplitDescUpdate};
+        instance.GetDevice().updateDescriptorSets(set_writes, {});
+    }
     cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
 }
 

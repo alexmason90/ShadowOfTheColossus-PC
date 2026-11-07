@@ -353,9 +353,19 @@ enum SplitPart {
     /// Inside the texture view lookup (FindTexture): the texture cache lock wait, page tracking
     /// of the image (TrackImage), the view itself (Image::FindView).
     SplitTexLock, SplitTexTrack, SplitTexMakeView,
+    /// Host-side Vulkan calls used to separate descriptor recording/update and queue submission.
+    SplitDescPush, SplitDescUpdate, SplitVkQueueSubmit, SplitSubmitLock,
     SplitParts
 };
 inline std::atomic<uint64_t> split_ticks[SplitParts]{};
+/// Opt-in, nonblocking Vulkan timestamp probes in Scheduler sessions.
+inline const bool kGpuTimestamps = [] {
+    const char* v = std::getenv("SOTC_GPU_TIMESTAMPS");
+    return v && v[0] != '\0' && v[0] != '0';
+}();
+inline std::atomic<uint64_t> gpu_timestamp_ns{0};
+inline std::atomic<uint64_t> gpu_timestamp_samples{0};
+inline std::atomic<uint64_t> gpu_timestamp_skipped{0};
 /// Deepest draw thread queue (back_head - back_tail at a publish) since the last flip.
 inline std::atomic<uint64_t> split_queue_max{0};
 /// Set by Liverpool::BackLoop: the waits count only on the draw thread.

@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include <cstring>
+#include <fstream>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -409,6 +410,20 @@ void VideoOutDriver::Flip(const Request& req) {
         constexpr int kColumns = SotcStats::FrameCauses + 2;
         static auto last_flip = now;
         static std::vector<float> frame_ms;
+        static std::ofstream frame_trace = [] {
+            std::ofstream out;
+            const char* path = std::getenv("SOTC_FRAME_TRACE");
+            if (path && path[0] != '\0') {
+                out.open(path, std::ios::out | std::ios::trunc);
+                if (out) {
+                    out << "window,frame,interval_ms\n";
+                } else {
+                    std::fprintf(stderr, "SOTC FRAME TRACE could not open the requested file\n");
+                }
+            }
+            return out;
+        }();
+        static uint64_t frame_trace_window = 0;
         static double worst_ms = 0.0;
         static uint64_t worst_ns[kColumns]{}, slow_ns[kColumns]{};
         static u32 slow_frames = 0;
@@ -529,6 +544,15 @@ void VideoOutDriver::Flip(const Request& req) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
             std::string report; // sotc: written at once off this thread (see ReportPrintf)
             {
+                if (frame_trace) {
+                    // Preserve arrival order. One small buffered write per five-second window;
+                    // no file I/O is added to the per-flip path.
+                    for (size_t i = 0; i < frame_ms.size(); ++i) {
+                        frame_trace << frame_trace_window << ',' << i << ',' << frame_ms[i] << '\n';
+                    }
+                    frame_trace.flush();
+                    ++frame_trace_window;
+                }
                 std::sort(frame_ms.begin(), frame_ms.end());
                 const auto pct = [&](double p) {
                     return frame_ms[std::min(frame_ms.size() - 1,
@@ -554,9 +578,9 @@ void VideoOutDriver::Flip(const Request& req) {
                 const auto late = std::count_if(frame_ms.begin(), frame_ms.end(),
                                                 [&](float ms) { return ms > late_ms; });
                 ReportPrintf(report,
-                             "SOTC FRAMES p50 %.1f ms, p99 %.1f ms (1%% low %.1f FPS), worst %.1f ms "
+                             "SOTC FRAMES p50 %.1f ms, p95 %.1f ms, p99 %.1f ms (1%% low %.1f FPS), worst %.1f ms "
                              "[%s]; >50 ms: %u [%s]; compiled %llu; late %lld of %zu\n",
-                             pct(0.5), pct(0.99), 1000.0 / pct(0.99), worst_ms,
+                             pct(0.5), pct(0.95), pct(0.99), 1000.0 / pct(0.99), worst_ms,
                              columns(worst_ns).c_str(), slow_frames, columns(slow_ns).c_str(),
                              static_cast<unsigned long long>(compiles),
                              static_cast<long long>(late), frame_ms.size());
@@ -918,6 +942,24 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
             }
+            if (SotcStats::kGpuTimestamps) {
+                const uint64_t gpu_ns = SotcStats::gpu_timestamp_ns.exchange(0,
+                                                                            std::memory_order_relaxed);
+                const uint64_t gpu_samples = SotcStats::gpu_timestamp_samples.exchange(
+                    0, std::memory_order_relaxed);
+                const uint64_t gpu_skipped = SotcStats::gpu_timestamp_skipped.exchange(
+                    0, std::memory_order_relaxed);
+                const double gpu_ms = gpu_ns / 1e6;
+                ReportPrintf(report,
+                             "SOTC GPU TIMESTAMPS completed %llu command-buffer spans: sum %.2f ms, "
+                             "mean %.3f ms/span, %.3f summed ms/game frame, %.1f%% of window; "
+                             "skipped %llu\n",
+                             static_cast<unsigned long long>(gpu_samples), gpu_ms,
+                             gpu_samples ? gpu_ms / gpu_samples : 0.0,
+                             flips ? gpu_ms / flips : 0.0,
+                             seconds > 0.0 ? 100.0 * gpu_ms / (seconds * 1000.0) : 0.0,
+                             static_cast<unsigned long long>(gpu_skipped));
+            }
             if (SotcStats::kDrawSplit && split_frames && split_tick0) {
                 const double ns = double(SotcStats::NowNs() - split_ns0);
                 const double ticks_per_ms =
@@ -937,7 +979,8 @@ void VideoOutDriver::Flip(const Request& req) {
                         "2 MB+, %.0f page faults), detile %.1f, record %.1f]; guest readbacks "
                         "on the draw thread [begin %.1f (submit %.1f), apply %.1f (dirty reread "
                         "%.1f), %.1f handed back]; "
-                        "draw waits gpu "
+                        "descriptor push %.1f, descriptor update %.1f; queue submit lock %.1f, "
+                        "vkQueueSubmit %.1f; draw waits gpu "
                         "%.1f, submit %.1f, recorder %.1f, frame %.1f; queue max %llu; guest "
                         "readback waits %.1f [queue %.1f, submit %.1f, gpu %.1f, finish %.1f]",
                         ms(threads + SplitThreadDraw), ms(SplitIdleSpin), ms(SplitIdle),
@@ -952,7 +995,8 @@ void VideoOutDriver::Flip(const Request& req) {
                         v[SplitTexBig] / frames, v[SplitTexFaults] / frames,
                         ms(SplitTexDetile), ms(SplitTexRecord), ms(SplitRbBegin),
                         ms(SplitRbBeginFlush), ms(SplitRbApply), ms(SplitRbDirty),
-                        v[SplitRbRetries] / frames, ms(SplitWaitGpu),
+                        v[SplitRbRetries] / frames, ms(SplitDescPush), ms(SplitDescUpdate),
+                        ms(SplitSubmitLock), ms(SplitVkQueueSubmit), ms(SplitWaitGpu),
                         ms(SplitWaitSubmit), ms(SplitWaitRecorder), ms(SplitWaitFrame),
                         static_cast<unsigned long long>(v[kSplitQueue]), v[SplitRbCount] / frames,
                         ms(SplitRbQueue), ms(SplitRbSubmit), ms(SplitRbGpu), ms(SplitRbFinish));

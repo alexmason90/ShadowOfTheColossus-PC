@@ -518,7 +518,9 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u32 gpu_query_base{UINT32_MAX};
     };
+    void HarvestGpuTimings();
     std::vector<Session> sessions;
     std::condition_variable_any event_cv;
     struct PendingOp {
@@ -542,6 +544,11 @@ private:
     vk::UniqueFence ahead_fence;
     u64 ahead_sequence{};
     bool ahead_unfinished{};
+    vk::UniqueQueryPool gpu_timestamp_pool;
+    u32 gpu_timestamp_head{};
+    u32 gpu_timestamp_pending{};
+    u32 gpu_timestamp_valid_bits{};
+    double gpu_timestamp_period_ns{};
     tracy::VkCtxScope* profiler_scope{};
     /// Newest tick the recording thread has put on the queue.
     std::atomic<u64> recorded_submit_tick{0};
