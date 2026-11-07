@@ -2,6 +2,7 @@
 from paths import ROOT
 from pathlib import Path
 import struct
+import re
 import subprocess
 import tempfile
 import unittest
@@ -52,6 +53,13 @@ class LoaderTests(unittest.TestCase):
             path.write_bytes(data)
             return subprocess.run([str(EXE.resolve()), str(path), '--cpu-only', *options],
                                   capture_output=True, text=True, timeout=5)
+
+    def test_image_fits_the_games_31_bit_static_pointers(self):
+        result=self.run_image(package(b'\xff\x25\x02\0\0\0\x90\x90', [(8, 1, 0, 0)], ['fixture-import']))
+        self.assertEqual(result.returncode,20,result.stdout+result.stderr)
+        match=re.search(r'Image at (0x[0-9a-fA-F]+)',result.stdout)
+        self.assertIsNotNone(match,result.stdout)
+        self.assertLess(int(match.group(1),16)+256*1024*1024,0x80000001)
 
     def test_original_instruction_reaches_named_import(self):
         # jmp [rip+2]; two padding bytes; relocated function pointer at +8

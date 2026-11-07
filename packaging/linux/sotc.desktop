@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Shadow of the Colossus
+Comment=Native Linux runtime (requires your own game dump)
+Exec=sotc
+Icon=sotc
+Categories=Game;
+Terminal=false

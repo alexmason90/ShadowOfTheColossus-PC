@@ -159,7 +159,7 @@ static void posix_mutexes(void) {
     m=NULL;
     assert(lock(&m)==0 && lock(&m)==11 && trylock(&m)==16);
     assert(unlock(&m)==0 && destroy(&m)==0);
-    assert(!runtime_resolve("dQHWEsJtoE4",0));
+    assert(runtime_resolve("dQHWEsJtoE4#A#B",0)==(uintptr_t)init);
 }
 static void wall_time(void) {
     typedef int (ABI *GetTime)(int64_t *,int32_t *);
@@ -173,7 +173,7 @@ static void wall_time(void) {
     assert(t.value[1]>=0 && t.value[1]<1000000);
     assert(t.canary==0xabcdef && z.canary==0x123456);
     assert(get(NULL,NULL)==0 && get(NULL,z.value)==0);
-    assert(!runtime_resolve("n88vx3C5nW8",0));
+    assert(runtime_resolve("n88vx3C5nW8#A#B",0)==(uintptr_t)get);
 }
 static void direct_memory(void) {
     Allocate alloc=GET(Allocate,"rTXw65xmLIA");
@@ -328,7 +328,8 @@ static void rw_timeouts(void) {
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI",0)==0);
     runtime_start(1);
-    assert(runtime_resolve("bzQExy189ZI",0)==0);
+    assert(runtime_resolve("bzQExy189ZI",0)!=0);
+    assert(runtime_resolve("bzQExy189ZI#A#B",0)==runtime_resolve("bzQExy189ZI",0));
     assert(runtime_resolve("unknown",0)==0);
     assert(runtime_resolve("8zTFvBIAIN8",1)==0);
     assert(runtime_resolve("f7uOxY9mM1U",0)==0);

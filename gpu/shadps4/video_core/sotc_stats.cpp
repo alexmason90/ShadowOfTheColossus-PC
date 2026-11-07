@@ -5,6 +5,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <time.h>
+#include <sys/resource.h>
 #endif
 
 namespace SotcStats {
@@ -39,6 +43,26 @@ uint64_t SplitProcessFaults() {
     return K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))
                ? counters.PageFaultCount
                : 0;
+}
+#elif defined(__linux__)
+static std::atomic<clockid_t> split_clocks[SplitThreads]{};
+void RegisterSplitThread(SplitThread which) {
+    if (!kDrawSplit) return;
+    clockid_t id{};
+    if (pthread_getcpuclockid(pthread_self(), &id) == 0)
+        split_clocks[which].store(id, std::memory_order_release);
+}
+uint64_t SplitThreadCycles(SplitThread which) {
+    const clockid_t id = split_clocks[which].load(std::memory_order_acquire);
+    timespec time{};
+    if (!id || clock_gettime(id, &time) != 0) return 0;
+    const double ms = double(time.tv_sec) * 1000.0 + double(time.tv_nsec) / 1e6;
+    return static_cast<uint64_t>(ms * TicksPerMs());
+}
+uint64_t SplitProcessFaults() {
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+    return uint64_t(usage.ru_minflt) + uint64_t(usage.ru_majflt);
 }
 #else
 void RegisterSplitThread(SplitThread) {}

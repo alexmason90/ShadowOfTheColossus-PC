@@ -7,6 +7,8 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <fstream>
+#include <vector>
 
 namespace BbSettings {
 
@@ -189,6 +191,18 @@ bool ResolutionNeedsRestart() {
 
 void Save() {
     const auto& v = Get();
+    // The Linux launcher shares this INI with the in-game menu. Preserve its
+    // startup options and input mappings when replacing renderer settings.
+    std::vector<std::string> startup;
+    std::ifstream input(Path());
+    for (std::string line; std::getline(input,line);) {
+        const auto first=line.find_first_not_of(" \t");
+        if (first==std::string::npos) continue;
+        const std::string_view trimmed{line.data()+first,line.size()-first};
+        if (trimmed.starts_with("SOTC_") || trimmed.starts_with("BB_") ||
+            trimmed.starts_with("key.") || trimmed.starts_with("pad.")) startup.push_back(line);
+    }
+    input.close();
     FILE* file = std::fopen(Path(), "w");
     if (!file) {
         std::printf("Settings: cannot write %s\n", Path());
@@ -217,6 +231,7 @@ void Save() {
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
+    for (const auto& line : startup) std::fprintf(file,"%s\n",line.c_str());
     std::fclose(file);
 }
 

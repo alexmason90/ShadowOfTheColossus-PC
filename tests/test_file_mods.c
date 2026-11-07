@@ -32,6 +32,35 @@ int main(void) {
         assert(path_op(path,2,0)==-EROFS);
         assert(do_rename(path,"/data/moved")==-EROFS);
     }
+#ifndef _WIN32
+    char mixed_dir[1024], mixed_file[1100];
+    snprintf(mixed_dir,sizeof(mixed_dir),"%s/MiXeD",game);
+    snprintf(mixed_file,sizeof(mixed_file),"%s/CacheD.psarc",mixed_dir);
+    assert(!mkdir(mixed_dir,0755));
+    f=fopen(mixed_file,"w"); assert(f); fputs("archive",f); fclose(f);
+    int folded=(int)do_open("/app0/mixed/cached.psarc",0,0); assert(folded>=3);
+    char archive[8]={0}; assert(do_read(folded,archive,7)==7 && !strcmp(archive,"archive"));
+    assert(!do_close(folded));
+    GuestStat folded_info; assert(!do_stat("/hostapp/MIXED/CACHED.PSARC",&folded_info) && folded_info.size==7);
+    char update[512], update_dir[1024], update_file[1100];
+    snprintf(update,sizeof(update),"%s/update",root);
+    snprintf(update_dir,sizeof(update_dir),"%s/MIXED",update);
+    snprintf(update_file,sizeof(update_file),"%s/CACHED.PSARC",update_dir);
+    assert(!mkdir(update,0755) && !mkdir(update_dir,0755));
+    f=fopen(update_file,"w"); assert(f); fputs("updated",f); fclose(f);
+    strcpy(update_root,update);
+    folded=(int)do_open("/app0/mixed/cached.psarc",0,0); assert(folded>=3);
+    memset(archive,0,sizeof(archive));
+    assert(do_read(folded,archive,7)==7 && !strcmp(archive,"updated"));
+    assert(!do_close(folded));
+    update_root[0]=0;
+    assert(!unlink(update_file) && !rmdir(update_dir) && !rmdir(update));
+    assert(!unlink(mixed_file) && !rmdir(mixed_dir));
+    int case_save=(int)do_open("/data/SaveName",0x202,0644); assert(case_save>=3);
+    assert(!do_close(case_save));
+    assert(do_open("/data/savename",0,0)==-ENOENT);
+    assert(!path_op("/data/SaveName",2,0));
+#endif
     int dir=(int)do_open("/app0",0x20000,0); assert(dir>=3);
     char entries[1024]; int64_t count=do_getdents(dir,entries,sizeof(entries),NULL); assert(count>0);
     int found=0;

@@ -91,4 +91,10 @@ void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);
+
+/* GPU/guest aliases and SotC page-pool release identification (all hosts). */
+uintptr_t runtime_memory_alias_of(uintptr_t address);
+int runtime_memory_alias_release(uintptr_t address);
+void runtime_memory_set_release_site(uintptr_t site);
+const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 #endif

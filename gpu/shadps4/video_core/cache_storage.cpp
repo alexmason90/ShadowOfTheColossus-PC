@@ -187,7 +187,11 @@ static constexpr char PackMagic[8] = {'S', 'O', 'T', 'C', 'P', 'K', '1', '\0'};
 
 static void ReadCachePack(const std::filesystem::path& path,
                           std::map<std::string, std::vector<u8>>& out) {
+#ifdef _WIN32
     std::FILE* f = _wfopen(path.c_str(), L"rb");
+#else
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+#endif
     if (!f) {
         return;
     }
@@ -238,7 +242,11 @@ static void WriteCachePack(std::filesystem::path path,
                            std::vector<std::pair<std::string, std::vector<u8>>> files) {
     auto tmp = path;
     tmp += L".tmp";
+#ifdef _WIN32
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");
+#else
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+#endif
     if (!f) {
         return;
     }

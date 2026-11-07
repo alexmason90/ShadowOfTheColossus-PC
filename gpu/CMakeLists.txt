@@ -23,6 +23,15 @@ if (BB_LTO)
     check_ipo_supported(RESULT bb_ipo_ok OUTPUT bb_ipo_error)
     if (bb_ipo_ok)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            # Limit GCC's link workers as well as Ninja's compile workers on 16 GiB hosts.
+            set(BB_LTO_JOBS "2" CACHE STRING "GCC LTO worker count")
+            if (NOT BB_LTO_JOBS MATCHES "^[1-9][0-9]*$")
+                message(FATAL_ERROR "BB_LTO_JOBS must be a positive integer")
+            endif()
+            set(CMAKE_C_COMPILE_OPTIONS_IPO -flto=${BB_LTO_JOBS} -fno-fat-lto-objects)
+            set(CMAKE_CXX_COMPILE_OPTIONS_IPO -flto=${BB_LTO_JOBS} -fno-fat-lto-objects)
+        endif()
     else()
         message(WARNING "LTO unavailable: ${bb_ipo_error}")
     endif()
@@ -39,6 +48,7 @@ elseif (BB_PGO STREQUAL "use" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options(-fprofile-use=${BB_PGO_DIR}/bbgpu.profdata -Wno-profile-instr-unprofiled
                         -Wno-profile-instr-out-of-date -Wno-profile-instr-missing
                         -Wno-backend-plugin)
+    add_link_options(-fprofile-use=${BB_PGO_DIR}/bbgpu.profdata)
 elseif (BB_PGO STREQUAL "generate")
     # Atomic counters: the GPU, recording, preparation and copy threads run the same code.
     add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
@@ -50,6 +60,9 @@ elseif (BB_PGO STREQUAL "use")
     # (or built differently for it, bbgpu_init) are compiled without it.
     add_compile_options(-fprofile-use=${BB_PGO_DIR} -fprofile-partial-training
                         -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
+    # GCC performs optimization again at the LTO link; pass the profile there too.
+    add_link_options(-fprofile-use=${BB_PGO_DIR} -fprofile-partial-training
+                     -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
 endif()
 
 find_package(Vulkan REQUIRED)
@@ -145,6 +158,9 @@ add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
 file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
+if (NOT WIN32)
+    list(FILTER VIDEO_CORE EXCLUDE REGEX "vk_fsr4\\.cpp$")
+endif()
 set(COMMON
     shadps4/common/decoder.cpp shadps4/common/error.cpp
     shadps4/common/io_file.cpp shadps4/common/native_clock.cpp shadps4/common/number_utils.cpp
@@ -177,7 +193,7 @@ target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
     BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
-target_include_directories(bbgpu PRIVATE third_party/stb)
+target_include_directories(bbgpu PRIVATE third_party/stb third_party/xbyak)
 # DLSS Frame Generation (vk_dlssg.cpp): NVIDIA Streamline SDK headers (MIT); the DLLs are
 # loaded at run time from the executable's folder.
 target_include_directories(bbgpu PRIVATE third_party/streamline/include)

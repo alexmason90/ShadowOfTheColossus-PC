@@ -49,7 +49,7 @@ def fail(message):
 
 
 def load_ini():
-    ini = PORT / 'sotc.ini'
+    ini = config_file()
     if ini.is_file():
         for line in ini.read_text(encoding='utf-8', errors='replace').splitlines():
             line = line.strip()
@@ -58,17 +58,35 @@ def load_ini():
                 os.environ.setdefault(name.strip(), value.strip())
 
 
+def data_dir():
+    """Writable data, including when PORT is a read-only AppImage mount."""
+    if os.name == 'nt':
+        return Path(os.environ.get('SOTC_USER_DIR', PORT / 'user')).resolve()
+    base = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share'))
+    return Path(os.environ.get('SOTC_USER_DIR', base / 'sotc')).resolve()
+
+
+def config_file():
+    if os.name == 'nt':
+        return PORT / 'sotc.ini'
+    base = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+    return Path(os.environ.get('SOTC_CONFIG', base / 'sotc/sotc.ini')).resolve()
+
+
 def no_console():
     """Started without a console (the launcher): console programs must not open their own."""
+    if os.name != 'nt':
+        return 0
     import ctypes
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
 def find_probe():
-    for candidate in (PORT / 'bin' / 'bb-probe.exe', PORT / 'out' / 'bb-probe.exe'):
+    name = 'bb-probe.exe' if os.name == 'nt' else 'bb-probe'
+    for candidate in (PORT / 'bin' / name, PORT / 'out' / name):
         if candidate.is_file():
             return candidate
-    fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
+    fail(f'{name} not found: run bash build.sh or use a packaged build.')
 
 
 def run_script(name, *args):
@@ -83,11 +101,14 @@ def run_script(name, *args):
 def fingerprint(game, modules):
     """Inputs of the prepared image: eboot, bundled modules, the user's modules, the scripts."""
     digest = hashlib.sha256()
-    files = [game / 'eboot.bin', *sorted((game / 'sce_module').glob('*.prx')), *modules,
-             *sorted(SCRIPTS.glob('*.py'))]
+    files = [game / 'eboot.bin', *sorted((game / 'sce_module').glob('*.prx')), *modules]
     for path in files:
         stat = path.stat()
         digest.update(f'{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}\n'.encode())
+    # AppImage mount paths change every launch. Script identities must stay relative.
+    for path in sorted(SCRIPTS.glob('*.py')):
+        digest.update(f'scripts/{path.name}\n'.encode())
+        digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
@@ -124,12 +145,31 @@ def merged_source(game, update, out):
     return merged
 
 
+def linux_performance_defaults(env):
+    """Windows launcher's established fast paths, with explicit overrides preserved."""
+    if os.name == 'nt' or env.get('SOTC_LINUX_PERF', '1') != '1':
+        return
+    defaults = {
+        'SOTC_RB_HOT': '1', 'SOTC_GUARD_STALE': '1',
+        'SOTC_GUARD_USER_POINTER': '1', 'SOTC_RELEASE_DEFER': '1',
+        'SOTC_IMAGE_DEDICATED': '1', 'BB_PRESENT_MODE': 'Mailbox',
+    }
+    for key, value in defaults.items():
+        env.setdefault(key, value)
+
+
 def main():
     load_ini()
+    if os.name != 'nt':
+        config_file().parent.mkdir(parents=True, exist_ok=True)
     env = os.environ
+    linux_performance_defaults(env)
+    if os.name != 'nt':
+        env['SOTC_PYTHON'] = sys.executable
+        env['SOTC_LAUNCH_SCRIPT'] = str(PORT / 'sotc.py')
     os.chdir(PORT)
-    out = PORT / 'out'
-    out.mkdir(exist_ok=True)
+    out = PORT / 'out' if os.name == 'nt' else data_dir() / 'prepared'
+    out.mkdir(parents=True, exist_ok=True)
     # The EU dump (CUSA08809) next to the port, else the US one (CUSA08034).
     default = next((PORT.parent / g for g in ('CUSA08809', 'CUSA08034') if (PORT.parent / g / 'eboot.bin').is_file()),
                    PORT.parent / 'CUSA08809')
@@ -217,19 +257,20 @@ def main():
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
-    if not (probe.parent / 'SDL3.dll').is_file():
+    if os.name == 'nt' and not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
-    user = Path(env.get('SOTC_USER_DIR', PORT / 'user')).resolve()
+    user = data_dir()
     user.mkdir(parents=True, exist_ok=True)
     env.setdefault('BB_GPU_USER_DIR', str(user))
     # Controls: key.<input>= / pad.<input>= lines of sotc.ini remap keys and buttons (src/runtime_pad.c).
-    env.setdefault('BB_CONFIG', str(PORT / 'sotc.ini'))
+    env.setdefault('BB_CONFIG', str(config_file()))
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--patches', str(out / 'patches.bin'),
                *(['--sotc-cmdline', str(out / 'cmdline.bin')] if (out / 'cmdline.bin').is_file() else []),
-               '--app0', str(game), '--user', str(user), *sys.argv[1:]]
+               '--app0', str(game), '--user', str(user),
+               *(['--timeout', '0'] if os.name != 'nt' else []), *sys.argv[1:]]
     # SOTC_WRAP: a JSON list put in front of the game, e.g. RenderDoc
     # ["C:/Program Files/RenderDoc/renderdoccmd.exe", "capture", "-w", "-c", "<file>"]; F12 then
     # captures the frame (SOTC_RDOC_SUBMITS submissions).

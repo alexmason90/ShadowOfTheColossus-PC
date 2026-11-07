@@ -16,7 +16,7 @@ int main(int argc,char **argv) {
     Param param=GET(Param,"99b82IKXpH4");
     List list=GET(List,"xnd8BJzAxmk");
     assert(load && loaded && unload && init && param && list);
-    assert(!runtime_content_resolve("g8cM39EUZ6o"));
+    assert(!runtime_content_resolve("unknown"));
     if (argc>1 && !strcmp(argv[1],"--missing")) { load(0xb4); return 99; }
     const uint32_t profile[]={1,13,0x80000000,0,7};
     runtime_content_configure(profile);

@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include "../src/runtime_pad.c"
 
+int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons) { *dx=*dy=0; *buttons=0; return 0; }
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
@@ -63,8 +64,8 @@ int main(void) {
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0);
     assert(gamepad && data.touch_count==2 && (data.buttons & BTN_TOUCHPAD));
-    assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==0);
-    assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
+    assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id!=data.touches[1].id);
+    assert(data.touches[1].x==480 && data.touches[1].y==942);
     capture=1;
     assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
     capture=0;

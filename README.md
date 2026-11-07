@@ -149,6 +149,15 @@ with `user/last_run.log`.
 
 ---
 
+## Linux (experimental)
+
+A native Linux build and AppImage packaging path are available in
+[packaging/linux/README.md](packaging/linux/README.md). Start the Linux launcher with
+`python3 launcher/sotc_launcher_linux.py` after building, or run the AppImage.
+This path uses Vulkan without Wine. Native FSR 3 frame generation is available
+(experimental); the Windows vendor integrations for DLSS and FSR 4 remain unavailable. Early gameplay was verified on an AMD RX 6700 XT; long-session
+and full-game stability still require testing.
+
 ## Building
 
 Windows with [MSYS2](https://www.msys2.org/) (CLANG64); packages:

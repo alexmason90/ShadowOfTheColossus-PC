@@ -152,6 +152,7 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
         // (SOTC_COPY_PREFETCH=0: one fault per page as before). At an area change (forest
         // entrance, 3 Nov) texture copies of 175-215 MB per frame took 10-59 thousand page faults,
         // one per 4 KiB page of the view; with it 311 MB took 6.5 thousand.
+#ifdef _WIN32
         static const bool prefetch = [] {
             const char* v = std::getenv("SOTC_COPY_PREFETCH");
             return !v || v[0] != '0';
@@ -160,6 +161,7 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             WIN32_MEMORY_RANGE_ENTRY range{const_cast<u8*>(backing), static_cast<SIZE_T>(n)};
             PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         }
+#endif
         if (backing) std::memcpy(dest, backing, n);
         else if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         else std::memset(dest, 0, n);

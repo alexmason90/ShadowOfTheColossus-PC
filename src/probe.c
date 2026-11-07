@@ -102,6 +102,25 @@ static void *allocate_image(size_t size) {
     printf("Image at %p (below 2 GiB, as the game's 31-bit pointers need); loader at %p\n",p,(void *)GetModuleHandleA(NULL));
     return p;
 }
+#else
+/* MAP_32BIT is specific to x86-64 Linux, which is also the guest architecture.
+ * Claim the image range before Vulkan/SDL can allocate in the low address space.
+ */
+#define EBOOT_RESERVATION (UINT64_C(256) << 20)
+static void *eboot_reservation;
+static void reserve_eboot_range(void) {
+    void *p=mmap(NULL,EBOOT_RESERVATION,PROT_NONE,
+                 MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT,-1,0);
+    if (p==MAP_FAILED || (uintptr_t)p+EBOOT_RESERVATION>UINT64_C(0x80000000))
+        fail("no free 256 MiB range below 2 GiB for the eboot");
+    eboot_reservation=p;
+}
+static void *allocate_image(size_t size) {
+    if (!eboot_reservation || size>EBOOT_RESERVATION) fail("image exceeds the low eboot reservation");
+    if (mprotect(eboot_reservation,size,PROT_READ|PROT_WRITE)) fail("cannot commit the low eboot range");
+    printf("Image at %p (below 2 GiB, as the game's 31-bit pointers need)\n",eboot_reservation);
+    return eboot_reservation;
+}
 #endif
 #ifdef _WIN32
 /* sotc: SOTC_HEAP_WATCH=1 (#146): every 5 s, the engine's heaps (the table at image+0x2dfaab0,
@@ -1461,7 +1480,9 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
     printf("Engine command line: %s\n",text);
 }
 #ifndef _WIN32
+#include "heap_hook_linux.h"
 static void fault(int sig, siginfo_t *info, void *context) {
+    if (sig == SIGTRAP && linux_heap_trap(info, context)) return;
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (gpu_enabled && sig == SIGSEGV) { /* T38: see the Windows handler */
         const uintptr_t at=(uintptr_t)info->si_addr, other=runtime_memory_alias_of(at);
@@ -1496,6 +1517,15 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    fprintf(stderr,"  rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx\n  rsi=%#llx rdi=%#llx rbp=%#llx rsp=%#llx\n  r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx\n",
+        (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],(unsigned long long)uc->uc_mcontext.gregs[REG_RBX],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_RCX],(unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_RSI],(unsigned long long)uc->uc_mcontext.gregs[REG_RDI],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_RBP],(unsigned long long)uc->uc_mcontext.gregs[REG_RSP],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_R8],(unsigned long long)uc->uc_mcontext.gregs[REG_R9],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_R10],(unsigned long long)uc->uc_mcontext.gregs[REG_R11],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_R12],(unsigned long long)uc->uc_mcontext.gregs[REG_R13],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_R14],(unsigned long long)uc->uc_mcontext.gregs[REG_R15]);
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
@@ -1646,9 +1676,11 @@ void runtime_restart(void) {
     /* The new launch waits for this process's GPU device to go away (run.py --after). */
     TerminateProcess(GetCurrentProcess(),0);
 #else
-    puts("Runtime: restarting through run.sh");
+    puts("Runtime: restarting the Linux game launcher");
+    const char *python=getenv("SOTC_PYTHON"), *script=getenv("SOTC_LAUNCH_SCRIPT");
     syscall(SYS_close_range, 3u, ~0u, 0u);
-    execlp("bash", "bash", "run.sh", (char *)NULL);
+    if (python && script) execl(python,python,script,(char *)NULL);
+    else execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
 #endif
@@ -1656,9 +1688,7 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifdef _WIN32
     reserve_eboot_range();
-#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -1745,7 +1775,7 @@ int main(int argc, char **argv) {
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGTRAP, &sa, NULL);
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -1853,11 +1883,7 @@ int main(int argc, char **argv) {
         }
     }
     /* sotc: the CPU patch trampolines follow the image (rel32 jumps reach them). */
-#ifdef _WIN32
     image = allocate_image(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#else
-    image = allocate(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -1943,7 +1969,12 @@ int main(int argc, char **argv) {
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
-    if (sotc_cpu) { install_heap_hook(); install_pool_hook(); install_release_hook(); }
+    if (sotc_cpu) {
+        install_heap_hook();
+#ifdef _WIN32
+        install_pool_hook(); install_release_hook();
+#endif
+    }
     /* T38: the page pool release's VirtualQuery call (runtime_memory.c, SOTC_POOL_OWNER) */
     if (sotc_cpu && image[0x1ac7d]==0xE8) runtime_memory_set_release_site((uintptr_t)(image+0x1ac82));
     { void bb_set_guest_image(uintptr_t base); bb_set_guest_image((uintptr_t)image); }

@@ -6,9 +6,14 @@
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+using HMODULE = void*;
+#endif
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -143,7 +148,7 @@ bool fg_on = false;
 bool options_set = false;
 u32 valid_streak = 0;
 u64 presents = 0;
-LARGE_INTEGER present_start{};
+std::chrono::steady_clock::time_point present_start{};
 double present_ms_sum = 0.0, present_ms_max = 0.0;
 u32 present_ms_count = 0;
 
@@ -168,7 +173,11 @@ void OnApiError(const sl::APIError& e) {
 
 template <typename T>
 bool Resolve(T*& out, const char* name) {
+#ifdef _WIN32
     out = reinterpret_cast<T*>(GetProcAddress(api.dll, name));
+#else
+    out = nullptr;
+#endif
     if (!out) {
         std::fprintf(stderr, "SOTC DLSSG: %s missing in sl.interposer.dll\n", name);
     }
@@ -488,11 +497,10 @@ bool MakeConstants(const Pending& p, u32 width, u32 height, sl::Constants& out) 
         return v && v[0] == '1';
     }();
     if (cam_log && next_index % 10 == 0) {
-        LARGE_INTEGER t, f;
-        QueryPerformanceCounter(&t);
-        QueryPerformanceFrequency(&f);
+        const auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         std::fprintf(stderr, "SOTC CAM %lld %.2f %.2f %.2f\n",
-                     static_cast<long long>(t.QuadPart * 1000 / f.QuadPart), p.cam.pos[0],
+                     static_cast<long long>(time_ms), p.cam.pos[0],
                      p.cam.pos[1], p.cam.pos[2]);
     }
     have_prev = true;
@@ -820,6 +828,7 @@ bool Capturing() {
 // is not the foreground window. The scripted benchmarks keep their window behind the user's
 // (it must never take the focus), so Streamline's GetForegroundWindow import is pointed at a
 // function returning the game window.
+#ifdef _WIN32
 HWND game_window{};
 
 BOOL CALLBACK FindGameWindow(HWND hwnd, LPARAM) {
@@ -879,6 +888,8 @@ void PatchForegroundWindow(const wchar_t* module_name) {
     }
 }
 
+#endif
+
 void SetOptions(bool on) {
     sl::DLSSGOptions options{};
     options.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
@@ -913,6 +924,11 @@ void SetOptions(bool on) {
 } // namespace
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
+#ifndef _WIN32
+    // The native FSR path below shares camera/depth/motion capture with DLSS,
+    // but never loads Windows Streamline binaries.
+    return nullptr;
+#else
     const char* u = std::getenv("SOTC_UPSCALER");
     fg_wanted = FrameGen::WantStreamline();
     sr_wanted = u && std::strcmp(u, "dlss") == 0;
@@ -997,6 +1013,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     std::fprintf(stderr, "SOTC DLSSG: Streamline %d.%d.%d loaded\n", SL_VERSION_MAJOR,
                  SL_VERSION_MINOR, SL_VERSION_PATCH);
     return gipa;
+#endif
 }
 
 void OnDeviceCreated(const Instance& instance) {
@@ -2202,7 +2219,7 @@ void BeforePresent(u32 frame_id, vk::Rect2D rect, vk::Extent2D extent) {
         api.set_tag(*token, sl::ViewportHandle{0}, tags.data(), 3, nullptr);
     }
     api.pcl_marker(sl::PCLMarker::ePresentStart, *token);
-    QueryPerformanceCounter(&present_start);
+    present_start = std::chrono::steady_clock::now();
 }
 
 void AfterPresent(u32 frame_id) {
@@ -2210,15 +2227,13 @@ void AfterPresent(u32 frame_id) {
         return;
     }
     const u32 index = frames[frame_id].index;
-    if (index != 0 && present_start.QuadPart) {
-        LARGE_INTEGER now, freq;
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&freq);
-        const double ms = double(now.QuadPart - present_start.QuadPart) * 1000.0 / freq.QuadPart;
+    if (index != 0 && present_start != std::chrono::steady_clock::time_point{}) {
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - present_start).count();
         present_ms_sum += ms;
         present_ms_max = std::max(present_ms_max, ms);
         ++present_ms_count;
-        present_start.QuadPart = 0;
+        present_start = {};
     }
     Marker(sl::PCLMarker::ePresentEnd, index);
     const bool stats = ++presents % 60 == 0;

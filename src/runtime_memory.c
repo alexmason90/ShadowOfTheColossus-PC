@@ -219,6 +219,7 @@ void runtime_memory_lock_stats(uint64_t *writes, double *wait_ms, double *hold_m
 void runtime_memory_lock_stats2(double *worst_hold_ms, uint64_t *read_waits, double *read_wait_ms) {
     *worst_hold_ms=*read_wait_ms=0; *read_waits=0;
 }
+uint64_t runtime_memory_carve_splits(void) { return 0; }
 void runtime_memory_carve_stats(uint64_t *mib, uint64_t *runs, double *split_ms, double *worst_ms, double *other_ms) {
     *mib=*runs=0; *split_ms=*worst_ms=*other_ms=0;
 }
@@ -1383,7 +1384,8 @@ void *runtime_low_map(size_t size, int prot) {
  * Colossus also waits there for labels its compute queues write: the frame then went ahead
  * without the compute results and the scene was never drawn (black screen in about half of
  * the boots). A BB_TOGGLE_FILE value replaces this default. */
-uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39;
+/* Keep the PR's optional GC-order and fixed-cost experiments off until measured. */
+uint64_t runtime_disabled_optimizations=(UINT64_C(1)<<20)|(UINT64_C(1)<<39)|(UINT64_C(1)<<59)|(UINT64_C(1)<<60);
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;

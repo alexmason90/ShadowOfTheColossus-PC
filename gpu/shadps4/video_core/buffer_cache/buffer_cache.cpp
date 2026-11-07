@@ -47,7 +47,7 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 /// the draw thread's VirtualProtect calls), every frame; a smaller window leaves the pages the
 /// guest does not read protected and GPU-modified. Read once, at static initialisation (no
 /// function-local guard in the fault paths); BufferCache::rb_narrow_window applies it.
-static const u64 rb_narrow_env = [] {
+static const u64 rb_narrow_env = []() -> u64 {
     const char* v = std::getenv("SOTC_RB_NARROW");
     const u64 kib = v ? std::strtoull(v, nullptr, 10) : 1;
     if (kib == 0) {
@@ -241,7 +241,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     // other job workers wait for) got one readback, and one wait for the GPU, per 64 KiB. Each
     // fault just past the last window doubles this thread's window, up to SOTC_RB_STREAM_MAX_KB
     // (4096); a fault elsewhere starts over. Same data, same path, fewer waits.
-    static const u64 stream_max = [] {
+    static const u64 stream_max = []() -> u64 {
         const char* on = std::getenv("SOTC_RB_STREAM");
         if (!on || on[0] != '1') {
             return u64{0};
@@ -275,9 +275,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         fault_size = size;
         DownloadMemory(arena, window_start, window_end - window_start);
         fault_size = 0;
-        if (is_write) {
-            MarkWrittenByGuest(device_addr, size);
-        }
+        FinishGuestFault(device_addr, size, is_write);
     };
     if (assume_locks) {
         flush_request();
@@ -295,16 +293,19 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     // The guest thread waits for the GPU, not the command processor.
-    // sotc: SOTC_RB_DIRTY_RETRY=1: up to 3 attempts end dirty and are asked again from here
-    // (FinishAsyncReadback); the last one rereads on the draw thread as before.
-    static const bool dirty_retry = [] {
-        const char* v = std::getenv("SOTC_RB_DIRTY_RETRY");
-        return v && v[0] == '1';
+    // PR #349: retry dirtied windows on the waiting guest, not the draw thread.
+    // The legacy switch still overrides the default; both switches can restore sync fallback.
+    static const int max_requeues = [] {
+        if (const char* v = std::getenv("SOTC_RB_DIRTY_RETRY")) {
+            return v[0] == '1' ? 3 : 0;
+        }
+        const char* v = std::getenv("SOTC_RB_REQUEUE");
+        return !v || v[0] != '0' ? 2 : 0;
     }();
     for (int attempt = 0;; ++attempt) {
         AsyncReadback readback{
             .device_addr = device_addr, .size = size, .stream = stream, .is_write = is_write};
-        readback.allow_retry = dirty_retry && attempt < 3;
+        readback.allow_retry = attempt < max_requeues;
         // sotc: SOTC_DRAW_SPLIT: the four parts of the guest's wait (draw thread queue and the copy
         // recorded there, the recorder submitting it, the GPU, the apply on the draw thread).
         const bool split = SotcStats::kDrawSplit;
@@ -377,11 +378,52 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                 }
             }
         }
-        liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+        liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback, true); });
         split_part(SotcStats::SplitRbFinish);
         if (!readback.retried) {
             return;
         }
+    }
+}
+
+void BufferCache::FinishGuestFault(VAddr addr, u64 size, bool is_write) {
+    if (is_write) {
+        MarkWrittenByGuest(addr, size);
+    } else {
+        DropUnbackedGpuPages(addr, size);
+    }
+}
+
+void BufferCache::DropUnbackedGpuPages(VAddr addr, u64 size) {
+    // sotc: a guest read fault's readback is done and its pages are still marked GPU-modified
+    // although no GPU-written byte backs them (the range left the set, the page bit stayed). Left
+    // set, the page stays read-protected and the load faults again forever: on a 4-thread run a
+    // job worker sat on its first load and no frame came (MMadmer fork, 23 Oct). The guest then
+    // reads its own memory. Pages that still hold GPU data (written since) stay protected, and a
+    // readback in flight over them unprotects them itself. MarkWrittenByGuest does the same for
+    // write faults.
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_READ_FAULT_DROP");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    if (!memory_tracker->IsRegionGpuModified(lo, hi - lo) || FindInflightReadback(lo, hi - lo)) {
+        return;
+    }
+    {
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        if (gpu_modified_ranges.Intersects(lo, hi - lo)) {
+            return;
+        }
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    if (SotcStats::read_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::fprintf(stderr, "SOTC read fault over a stale GPU page at %#llx: unprotected\n",
+                     static_cast<unsigned long long>(addr));
     }
 }
 
@@ -428,9 +470,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             readback.dependent = true;
             return;
         }
-        if (readback.is_write) {
-            MarkWrittenByGuest(readback.device_addr, readback.size);
-        }
+        FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
         return;
     }
     // Held until FinishAsyncReadback: the pool must not hand it out again before.
@@ -476,8 +516,11 @@ void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size) {
     // which the guest may write) changed these bytes: asynchronous readbacks of them in flight
     // hold stale data (FinishAsyncReadback reads them back again).
     for (AsyncReadback* readback : inflight_readbacks) {
-        for (const auto& item : readback->pending) {
-            readback->dirty |= addr < item.addr + item.size && item.addr < addr + size;
+        for (auto& item : readback->pending) {
+            if (addr < item.addr + item.size && item.addr < addr + size) {
+                item.dirty = true;
+                readback->dirty = true;
+            }
         }
     }
 }
@@ -496,22 +539,18 @@ BufferCache::AsyncReadback* BufferCache::FindInflightReadback(VAddr addr, u64 si
     return nullptr;
 }
 
-void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
+void BufferCache::FinishAsyncReadback(AsyncReadback& readback, bool owner) {
     const SotcStats::SplitTimer apply_split{SotcStats::SplitRbApply};
     if (readback.dependent) {
         // Finish the readbacks this one waited for (owners still blocked keep them alive).
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
             FinishAsyncReadback(*other);
         }
-        if (readback.is_write) {
-            MarkWrittenByGuest(readback.device_addr, readback.size);
-        }
+        FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
         return;
     }
     if (readback.finished) {
-        if (readback.is_write) {
-            MarkWrittenByGuest(readback.device_addr, readback.size);
-        }
+        FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
         return;
     }
     readback.finished = true;
@@ -523,36 +562,47 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         .mapped = const_cast<u8*>(readback.download_mapped),
         .type = VideoCore::MemoryType::HostCached,
     };
-    if (readback.dirty && readback.allow_retry) {
-        // sotc: SOTC_RB_DIRTY_RETRY=1: the guest thread asks again (ReadMemory), and waits for
-        // the GPU itself. The reread below makes the draw thread, the bottleneck at area
-        // changes, wait for the GPU: 8-15 ms per slow frame at the forest entrance (5 Nov; the
-        // visibility bitmaps are rewritten every frame, so their readbacks often turn dirty).
-        staging_pool.FreeDeferred(download);
-        readback.retried = true;
-        if (SotcStats::kDrawSplit) {
-            SotcStats::split_ticks[SotcStats::SplitRbRetries].fetch_add(1,
-                                                                        std::memory_order_relaxed);
-        }
-        return;
-    } else if (readback.dirty) {
-        // A GPU write recorded after the copies (or another readback applied first and the
-        // guest may have written since): the data may be stale. The ranges never left the
-        // GPU-modified set; read the window back the usual way.
-        const SotcStats::SplitTimer dirty_split{SotcStats::SplitRbDirty};
-        staging_pool.FreeDeferred(download);
-        DownloadMemory(readback.arena, readback.window_start, readback.window_size);
-    } else {
+    // PR #349: keep clean items when a concurrent write invalidates only part of a window.
+    // Hot speculative items stay protected if dirty and are fetched on their own fault.
+    static const bool partial_finish = [] {
+        const char* v = std::getenv("SOTC_RB_PART");
+        return !v || v[0] != '0';
+    }();
+    bool window_dirty = readback.dirty;
+    if (readback.dirty && partial_finish) {
         download.buffer->Invalidate(download.offset, download.size);
-        // sotc: the ranges leave the GPU-modified set only once the backing holds their data:
-        // the command processor's clean reads (ReadClean) would read the stale backing before.
+        boost::container::small_vector<ReadbackItem, 16> clean;
+        window_dirty = false;
+        for (auto& item : readback.pending) {
+            if (!item.dirty) {
+                clean.push_back(std::move(item));
+            } else if (!item.hot) {
+                window_dirty = true;
+            }
+        }
+        ApplyDownloads(clean, download.mapped, download.offset);
+        SubtractDownloaded(clean);
+    } else if (!readback.dirty) {
+        download.buffer->Invalidate(download.offset, download.size);
         ApplyDownloads(readback.pending, download.mapped, download.offset);
         SubtractDownloaded(readback.pending);
-        staging_pool.FreeDeferred(download);
     }
-    if (readback.is_write) {
-        MarkWrittenByGuest(readback.device_addr, readback.size);
+    staging_pool.FreeDeferred(download);
+    if (window_dirty) {
+        // Only its owner can request another round trip. A dependent readback must finish
+        // synchronously before its guest can touch the bytes, even if the owner may retry.
+        if (owner && readback.allow_retry) {
+            readback.retried = true;
+            if (SotcStats::kDrawSplit) {
+                SotcStats::split_ticks[SotcStats::SplitRbRetries].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        const SotcStats::SplitTimer dirty_split{SotcStats::SplitRbDirty};
+        DownloadMemory(readback.arena, readback.window_start, readback.window_size);
     }
+    FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -772,7 +822,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                     }
                 };
                 for (VAddr page = address; page < range_end;) {
-                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
+                    const VAddr next = std::min<VAddr>(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
                     if (memory_tracker->IsRegionCpuModified(page, next - page)) {
                         flush_run(page);
                         run_start = next;
@@ -1667,7 +1717,11 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             block_last_use[block] = use_epoch;
         }
     };
-    auto& cached = resident_cache[(first_block * 0x9E3779B97F4A7C15ull) >> 58];
+    static const unsigned shift = [] {
+        const char* v = std::getenv("SOTC_CACHE_WIDE");
+        return v && v[0] == '1' ? 54u : 58u;
+    }();
+    auto& cached = resident_cache[(first_block * 0x9E3779B97F4A7C15ull) >> shift];
     if (cached.version == resident_version && first_block >= cached.first &&
         last_block < cached.end) {
         if (cached.epoch != use_epoch) {

@@ -105,7 +105,8 @@ void runtime_file_configure(const char *app0,const char *user) {
         for (int i=0;i<2 && !update_root[0];++i) {
             snprintf(path,sizeof(path),"%s%s",app0,suffixes[i]);
             HostStat st;
-            if (!host_stat(path,&st) && S_ISDIR(st.st_mode)) snprintf(update_root,sizeof(update_root),"%s",path);
+            if (strlen(path)<sizeof(update_root) && !host_stat(path,&st) && S_ISDIR(st.st_mode))
+                memcpy(update_root,path,strlen(path)+1);
         }
     }
     if (update_root[0]) printf("Runtime: game update overlaid from %s\n",update_root);
@@ -118,6 +119,56 @@ void runtime_file_configure(const char *app0,const char *user) {
         runtime_file_mount(guest,path);
     }
 }
+/* The engine lowercases asset paths, including pakN.psarc and cachedFiles.psarc.
+ * Resolve existing game assets component by component on case-sensitive hosts.
+ * Exact names win; ambiguous folded names fail rather than choosing arbitrarily.
+ * Writable save mounts retain their host's case semantics.
+ */
+#ifndef _WIN32
+#include <strings.h>
+static void game_path_case(char *path, size_t capacity) {
+    struct stat st;
+    if (!stat(path, &st)) return;
+    char corrected[2048];
+    if (path[0]!='/' || strlen(path)>=sizeof(corrected)) return;
+    strcpy(corrected, "/");
+    const char *at=path+1;
+    while (*at) {
+        const char *slash=strchr(at, '/');
+        const size_t len=slash ? (size_t)(slash-at) : strlen(at);
+        if (!len) { ++at; continue; }
+        size_t prefix=strlen(corrected);
+        if (prefix+len+2>=sizeof(corrected)) return;
+        if (prefix>1) corrected[prefix++]='/';
+        memcpy(corrected+prefix, at, len);
+        corrected[prefix+len]=0;
+        if (stat(corrected, &st)) {
+            corrected[prefix ? prefix-1 : 0]=0;
+            DIR *dir=opendir(prefix<=1 ? "/" : corrected);
+            if (!dir) return;
+            char component[NAME_MAX+1], match[NAME_MAX+1]={0};
+            if (len>NAME_MAX) { closedir(dir); return; }
+            memcpy(component, at, len); component[len]=0;
+            struct dirent *entry;
+            int count=0;
+            while ((entry=readdir(dir))) {
+                if (!strcasecmp(component, entry->d_name)) {
+                    if (++count>1) break;
+                    snprintf(match,sizeof(match),"%s",entry->d_name);
+                }
+            }
+            closedir(dir);
+            if (count!=1 || prefix+strlen(match)>=sizeof(corrected)) return;
+            corrected[prefix-1]='/';
+            memcpy(corrected+prefix,match,strlen(match)+1);
+        }
+        at=slash ? slash+1 : at+len;
+    }
+    if (!stat(corrected, &st) && strlen(corrected)<capacity) strcpy(path,corrected);
+}
+#else
+static void game_path_case(char *path, size_t capacity) { (void)path; (void)capacity; }
+#endif
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
@@ -140,9 +191,12 @@ static int translate(const char *guest,char *out,size_t size) {
     if (!result && game_path && update_root[0] && buffer[best]) {
         char updated[1100];
         HostStat st;
-        if ((size_t)snprintf(updated,sizeof(updated),"%s%s",update_root,buffer+best)<sizeof(updated) &&
-            !host_stat(updated,&st) && (size_t)snprintf(out,size,"%s",updated)>=size) result=ENAMETOOLONG;
+        if ((size_t)snprintf(updated,sizeof(updated),"%s%s",update_root,buffer+best)<sizeof(updated)) {
+            game_path_case(updated,sizeof(updated));
+            if (!host_stat(updated,&st) && (size_t)snprintf(out,size,"%s",updated)>=size) result=ENAMETOOLONG;
+        }
     }
+    if (!result && game_path) game_path_case(out,size);
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     return result;
 }

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+APPDIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+export PYTHONHOME="$APPDIR/usr"
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+unset PYTHONPATH
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TCL_LIBRARY="$APPDIR/usr/share/tcltk/tcl8.6"
+export TK_LIBRARY="$APPDIR/usr/share/tcltk/tk8.6"
+exec "$APPDIR/usr/bin/python3" "$APPDIR/usr/share/sotc/launcher/sotc_launcher_linux.py" "$@"

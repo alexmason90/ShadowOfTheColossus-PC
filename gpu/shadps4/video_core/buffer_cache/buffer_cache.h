@@ -220,6 +220,7 @@ private:
         boost::container::small_vector<std::pair<VAddr, u64>, 4> gpu_ranges;
         /// sotc: brought along by the hot readbacks (SOTC_RB_HOT), not asked for.
         bool hot = false;
+        bool dirty = false; ///< Rewritten after this item was copied.
     };
     /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
     /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller
@@ -268,7 +269,9 @@ private:
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
     void MarkWrittenByGuest(VAddr addr, u64 size);
-    void FinishAsyncReadback(AsyncReadback& readback);
+    void FinishGuestFault(VAddr addr, u64 size, bool is_write);
+    void DropUnbackedGpuPages(VAddr addr, u64 size);
+    void FinishAsyncReadback(AsyncReadback& readback, bool owner = false);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);
     std::vector<AsyncReadback*> inflight_readbacks;
@@ -352,7 +355,7 @@ private:
         u64 end{};
         u16 epoch{}; ///< sotc: use epoch its blocks were last stamped with
     };
-    std::array<ResidentCacheEntry, 64> resident_cache{};
+    std::array<ResidentCacheEntry, 1024> resident_cache{};
     u64 dma_runs_version = ~0ULL;
     size_t dma_runs_arenas{};
     u64 dma_runs_ranges{};
