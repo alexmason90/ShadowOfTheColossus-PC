@@ -145,6 +145,13 @@ BufferCache::~BufferCache() {
     std::free(block_last_use);
 }
 
+void BufferCache::OnMappingChanged() {
+    clean_map_generation.fetch_add(1, std::memory_order_release);
+    if (SotcStats::kBufferProfile) {
+        SotcStats::buffer_mapping_invalidations.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void BufferCache::TickFrame() {
     ProcessPendingReleases(); // sotc: SOTC_RELEASE_DEFER
     if (std::exchange(fault_process_pending, false)) {
@@ -1170,6 +1177,8 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    const SotcStats::BufferObtainProfileContext profile_context;
+    const SotcStats::BufferProfileTimer obtain_timer{SotcStats::BufferObtain};
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     // sotc: SOTC_STREAM_THRESHOLD=<bytes> (default 16 KiB) for A/B: small read-only buffers are
     // copied into the stream buffer on every bind instead of using the synchronized arena.
@@ -1180,22 +1189,37 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         return v ? std::strtoull(v, nullptr, 0) : u64{0};
     }();
     if (!is_written && size <= stream_threshold && !IsRegionGpuModified(device_addr, size)) {
+        if (SotcStats::kBufferProfile) {
+            SotcStats::buffer_stream_returns.fetch_add(1, std::memory_order_relaxed);
+        }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
         return {&stream_buffer, offset};
     }
+    SotcStats::RecordBufferRange(device_addr, size, is_written, is_texel_buffer);
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
+    const Buffer* arena;
+    {
+        const SotcStats::BufferProfileTimer lookup_timer{SotcStats::BufferArenaLookup};
+        arena = GetArena(first_block, last_block);
+    }
+    {
+        const SotcStats::BufferProfileTimer resident_timer{SotcStats::BufferResidency};
+        EnsureResident(arena, first_block, last_block);
+    }
     // SynchronizeMemory also syncs read-only texel buffers from an aliasing image (sotc: a second
     // SynchronizeMemoryFromImage call here repeated that work, re-tiling the image twice).
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (SotcStats::OptOff() && is_texel_buffer && !is_written) {
-        SynchronizeMemoryFromImage(arena, device_addr, size);
+    {
+        const SotcStats::BufferProfileTimer sync_timer{SotcStats::BufferSynchronize};
+        SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+        if (SotcStats::OptOff() && is_texel_buffer && !is_written) {
+            SynchronizeMemoryFromImage(arena, device_addr, size);
+        }
     }
     if (is_written) {
+        const SotcStats::BufferProfileTimer write_timer{SotcStats::BufferWriteTracking};
         Core::MemoryManager::NoteHostWrite(
             device_addr, size, 8, reinterpret_cast<u64>(__builtin_return_address(0)));
         AddGpuModified(device_addr, size);
@@ -1653,6 +1677,11 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             for (u64 page = group_first; page <= group_last; ++page) {
                 address_space[page] = new_arena;
             }
+            if (SotcStats::kBufferProfile) {
+                SotcStats::buffer_arena_creates.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::buffer_arena_page_rewrites.fetch_add(num_pages,
+                                                                 std::memory_order_relaxed);
+            }
             std::fprintf(stderr, "SOTC arena at %#llx, %llu GB\n",
                          static_cast<unsigned long long>(group_first << ARENA_PAGE_BITS),
                          static_cast<unsigned long long>(num_pages << (ARENA_PAGE_BITS - 30)));
@@ -1697,6 +1726,11 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     base_page = last_page;
     for (u32 page = 0; page < (last_size >> ARENA_PAGE_BITS); ++page) {
         address_space[base_page + page] = new_arena;
+    }
+    if (SotcStats::kBufferProfile) {
+        SotcStats::buffer_arena_merges.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::buffer_arena_page_rewrites.fetch_add(
+            (first_size + last_size) >> ARENA_PAGE_BITS, std::memory_order_relaxed);
     }
     return new_arena;
 }
@@ -1780,6 +1814,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.offset = memory_block;
         resident_ranges.Add(backing);
         ++resident_version; // sotc: invalidates the merged DMA runs
+        SotcStats::NoteBufferResidentInvalidation();
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 
@@ -1806,11 +1841,17 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                     bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
-    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
-        copies.emplace_back(total_size_bytes, addr, size);
-        total_size_bytes += size;
-    });
+    {
+        const SotcStats::BufferProfileTimer scan_timer{SotcStats::BufferSyncRangeScan,
+                                                       SotcStats::t_buffer_obtain_profile};
+        memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
+            copies.emplace_back(total_size_bytes, addr, size);
+            total_size_bytes += size;
+        });
+    }
     if (!copies.empty()) {
+        const SotcStats::BufferProfileTimer upload_timer{SotcStats::BufferSyncUpload,
+                                                         SotcStats::t_buffer_obtain_profile};
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};
         if (SotcStats::kFpsLog) {
             SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
@@ -1867,6 +1908,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+    const SotcStats::BufferProfileTimer image_timer{SotcStats::BufferSyncImage,
+                                                    SotcStats::t_buffer_obtain_profile};
     // sotc: a current write is recorded only on the two paths that write the arena range. Recording
     // it unconditionally marked unwritten ranges as written by the command buffer being recorded,
     // which sent their readbacks to the slower flushing path instead of the ahead path.
@@ -2176,6 +2219,7 @@ void BufferCache::ReleaseBlocks(u64 first_block, u64 end_block, bool finish) {
     });
     resident_ranges.Subtract(first_block, end_block);
     ++resident_version; // sotc: invalidates the merged DMA runs
+    SotcStats::NoteBufferResidentInvalidation();
     {
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         gpu_modified_ranges.Subtract(first_block << block_shift,
@@ -2420,6 +2464,7 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
     if (!released.empty()) {
         UnbindResident(released);
         ++resident_version; // sotc: invalidates the merged DMA runs and the resident cache
+        SotcStats::NoteBufferResidentInvalidation();
         // A bind of the same blocks recorded before the next submit would share one sparse
         // bind batch with the unbind; submit the unbind on its own.
         scheduler.Flush();

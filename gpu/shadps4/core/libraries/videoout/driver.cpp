@@ -659,6 +659,84 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
                          static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
                          static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
+            if (SotcStats::kBufferProfile) {
+                uint64_t stage_ns[SotcStats::BufferProfileStages]{};
+                uint64_t stage_calls[SotcStats::BufferProfileStages]{};
+                for (int stage = 0; stage < SotcStats::BufferProfileStages; ++stage) {
+                    stage_ns[stage] =
+                        SotcStats::buffer_stage_ns[stage].exchange(0, std::memory_order_relaxed);
+                    stage_calls[stage] = SotcStats::buffer_stage_calls[stage].exchange(
+                        0, std::memory_order_relaxed);
+                }
+                const uint64_t range_calls = SotcStats::buffer_range_calls.exchange(0);
+                const uint64_t range_repeats = SotcStats::buffer_range_repeats.exchange(0);
+                const uint64_t range_consecutive = SotcStats::buffer_range_consecutive.exchange(0);
+                const uint64_t range_first = SotcStats::buffer_range_first.exchange(0);
+                const uint64_t range_collisions = SotcStats::buffer_range_collisions.exchange(0);
+                ReportPrintf(
+                    report,
+                    "SOTC BUFFER PROFILE: arena-calls=%llu exact-repeat=%llu/%llu (%.1f%%; consecutive=%llu, slot-collisions=%llu, first-observations=%llu); "
+                    "ms/frame obtain=%.3f arena=%.3f resident=%.3f sync=%.3f scan=%.3f upload=%.3f image=%.3f write=%.3f; "
+                    "ns/call obtain=%llu arena=%llu resident=%llu sync=%llu scan=%llu upload=%llu image=%llu write=%llu; "
+                    "invalidations resident=%llu mapping=%llu arena(create/merge/pages)=%llu/%llu/%llu stream(wrap/return)=%llu/%llu\n",
+                    static_cast<unsigned long long>(range_calls),
+                    static_cast<unsigned long long>(range_repeats),
+                    static_cast<unsigned long long>(range_calls),
+                    range_calls ? 100.0 * range_repeats / range_calls : 0.0,
+                    static_cast<unsigned long long>(range_consecutive),
+                    static_cast<unsigned long long>(range_collisions),
+                    static_cast<unsigned long long>(range_first),
+                    stage_ns[SotcStats::BufferObtain] / 1e6 / flips,
+                    stage_ns[SotcStats::BufferArenaLookup] / 1e6 / flips,
+                    stage_ns[SotcStats::BufferResidency] / 1e6 / flips,
+                    stage_ns[SotcStats::BufferSynchronize] / 1e6 / flips,
+                    stage_ns[SotcStats::BufferSyncRangeScan] / 1e6 / flips,
+                    stage_ns[SotcStats::BufferSyncUpload] / 1e6 / flips,
+                    stage_ns[SotcStats::BufferSyncImage] / 1e6 / flips,
+                    stage_ns[SotcStats::BufferWriteTracking] / 1e6 / flips,
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferObtain]
+                                                        ? stage_ns[SotcStats::BufferObtain] /
+                                                              stage_calls[SotcStats::BufferObtain]
+                                                        : 0),
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferArenaLookup]
+                                                        ? stage_ns[SotcStats::BufferArenaLookup] /
+                                                              stage_calls[SotcStats::BufferArenaLookup]
+                                                        : 0),
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferResidency]
+                                                        ? stage_ns[SotcStats::BufferResidency] /
+                                                              stage_calls[SotcStats::BufferResidency]
+                                                        : 0),
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferSynchronize]
+                                                        ? stage_ns[SotcStats::BufferSynchronize] /
+                                                              stage_calls[SotcStats::BufferSynchronize]
+                                                        : 0),
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferSyncRangeScan]
+                                                        ? stage_ns[SotcStats::BufferSyncRangeScan] /
+                                                              stage_calls[SotcStats::BufferSyncRangeScan]
+                                                        : 0),
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferSyncUpload]
+                                                        ? stage_ns[SotcStats::BufferSyncUpload] /
+                                                              stage_calls[SotcStats::BufferSyncUpload]
+                                                        : 0),
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferSyncImage]
+                                                        ? stage_ns[SotcStats::BufferSyncImage] /
+                                                              stage_calls[SotcStats::BufferSyncImage]
+                                                        : 0),
+                    static_cast<unsigned long long>(stage_calls[SotcStats::BufferWriteTracking]
+                                                        ? stage_ns[SotcStats::BufferWriteTracking] /
+                                                              stage_calls[SotcStats::BufferWriteTracking]
+                                                        : 0),
+                    static_cast<unsigned long long>(
+                        SotcStats::buffer_resident_invalidations.exchange(0)),
+                    static_cast<unsigned long long>(
+                        SotcStats::buffer_mapping_invalidations.exchange(0)),
+                    static_cast<unsigned long long>(SotcStats::buffer_arena_creates.exchange(0)),
+                    static_cast<unsigned long long>(SotcStats::buffer_arena_merges.exchange(0)),
+                    static_cast<unsigned long long>(
+                        SotcStats::buffer_arena_page_rewrites.exchange(0)),
+                    static_cast<unsigned long long>(SotcStats::buffer_stream_wraps.exchange(0)),
+                    static_cast<unsigned long long>(SotcStats::buffer_stream_returns.exchange(0)));
+            }
             if (SotcStats::kVisDirect) {
                 ReportPrintf(report,
                              "SOTC VIS DIRECT: %llu bitmaps written in the game's memory, %llu honest "

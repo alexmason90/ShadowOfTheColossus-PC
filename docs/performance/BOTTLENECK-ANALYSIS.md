@@ -147,10 +147,11 @@ lookup:
 5. Writable ranges additionally call `NoteHostWrite`, `AddGpuModified` (including
    in-flight-readback and clean-page tracking), and `RecordCurrentWrite`.
 
-The existing profiles do **not** give separate timings for these stages, exact-range
-key frequency (consecutive or within a frame), unique-key counts, or generation and
-arena invalidation rates. None of those values can be inferred from the 4.0 ms
-inclusive caller timer or from the resident cache's own hit path.
+The Phase-A follow-up adds opt-in wall-time counters for `ObtainBuffer`, `GetArena`,
+`EnsureResident`, `SynchronizeMemory`, its dirty-range scan/upload/image work, and
+write tracking. It also samples exact `(address, size, read/write, texel)` recurrence
+in a bounded per-thread direct-mapped table and counts mapping/residency/arena
+changes. The measurements and their substantial observer effect are detailed below.
 
 Source review identifies invalidation concerns for any future cache. Resident-range
 additions, releases and cold evictions advance `resident_version`; `GetArena` can
@@ -162,28 +163,82 @@ storage. A cached result must also exclude the stream-buffer return path. Regard
 of a lookup hit, `EnsureResident`, `SynchronizeMemory`, GPU-write tracking and the
 caller-side access/barrier checks must continue to run.
 
-### Phase-A execution status and Phase-B gate
+### Phase-A measurements and Phase-B gate
 
-The existing report contains a prior four-run probe-free 1080p reference (46.80 FPS;
-per-window p50/p95/p99 of 21.35/24.55/27.10 ms). It is preserved reference data, not
-a new baseline run for this follow-up. A fresh current-source build and run could not
-be made in this environment: CMake, Ninja and Vulkan development headers are
-unavailable. Therefore no claim is made that the current instrumentation was built
-or linked here, and no new stage timings, exact-key repetition counts, or
-invalidation frequencies are reported. Phase A is incomplete; Phase B has not
-started, and no cache optimization has been implemented.
+The follow-up used one Linux PGO-off/LTO-off source build (`libbbgpu.so`
+SHA-256 `1d10f82712e5cf981c4d2d0fd50a8432a4ab211f45f5aba8e30cef3d69ee5b5c`),
+with a fresh copy of the isolated benchmark save for each run. This is not the same
+build configuration as the earlier PGO/LTO main matrix above, so its FPS is reported
+as a separate comparison, not substituted for that reference. Twelve valid runs
+passed the settled-scene gate (four per arm, nine windows per run at game time
+25–65 s). One original trace run failed to reach the scene; it was preserved and
+excluded, and a fresh retry passed. The earlier v2 attempts were also excluded.
 
-After a complete Linux build environment is available, add only opt-in aggregate
-probes for the stages above and count exact-key calls, distinct keys and repeat hits
-without per-call logging. Record arena/page-map and relevant generation changes
-separately. Proceed to an opt-in exact-range lookup experiment only if those data
-show both substantial reuse and material lookup cost. Verify every hit against the
-existing path and conservatively invalidate on any backing-arena, mapping, or
-generation change. Then compare default and experiment with four interleaved runs
-per variant at 1080p, probe-free for FPS, and separate diagnostic runs. Require
-correctness checks and repeatable improvement in native FPS and p50/p95/p99; reject
-the experiment if lookup is not material, reuse is rare, or coherence cannot be
-preserved. **No optimization is justified by the available measurements.**
+| 1080p arm | Median FPS | Median per-window p50 / p95 / p99 (ms) |
+| --- | ---: | ---: |
+| FPS-only (no frame trace or buffer profile) | **44.25** | — |
+| Frame trace only | 43.65 | 22.93 / 26.12 / 29.13 |
+| Frame trace + ObtainBuffer profile and exact-range sampler | 31.05 | 32.34 / 35.44 / 38.00 |
+
+Adding frame tracing reduced median FPS by 1.4% versus FPS-only. Adding the buffer
+profile and exact-range sampler on top of frame tracing reduced median FPS by
+**28.9%**. The buffer instrumentation is therefore strongly perturbative. Profile
+timings below are diagnostic costs measured with the instrumentation active, not a
+clean estimate of the uninstrumented path; the profiled FPS and frame percentiles
+must not be used as performance baselines.
+
+Across the four profile runs, the median of each run's settled-window medians was:
+
+| Stage | Instrumented ms/game-frame | Instrumented ns/call |
+| --- | ---: | ---: |
+| `ObtainBuffer` inclusive | 9.476 | 408 |
+| `GetArena` | 0.622 | 26 |
+| `EnsureResident` | 0.860 | 36 |
+| `SynchronizeMemory` | 4.277 | 184 |
+| `ForEachUploadRange` traversal and tracking (nested in synchronization) | 1.876 | 80 |
+| Upload work (nested in synchronization) | 0.483 | 5,735 per upload call |
+| Aliased-image synchronization | 0.408 | 47 |
+| Writable-range tracking | 0.877 | 305 |
+
+The substage timings are nested within their parent and are not additive. In
+particular, `SynchronizeMemory` includes the dirty-range scan, upload, and image work.
+These wall-time measurements also include per-call timer and sampler overhead; the
+28.9% FPS penalty means even the individual stage values should be treated as
+instrumented-path measurements rather than precise baseline attribution. The
+`ForEachUploadRange` timer encloses more than bit inspection: its callback builds the
+copy list, and a dirty result also clears CPU-dirty state, coalesces runs, acquires the
+region mutex, and may update page-protection watchers.
+
+The bounded per-thread sampler observed **87.8% exact-range repeats** across
+131,284,926 arena-path calls in the 36 settled profile windows (180 seconds);
+10.4% of calls repeated the immediately preceding key. Direct-map slot collisions
+were 12.2% of calls and can hide real repeats, so the measured recurrence is a lower
+bound. Stream-buffer returns bypass this sample.
+
+During those settled windows, resident-generation invalidations, mapping-generation
+invalidations, arena creation/merge, and arena page rewrites were all **zero**.
+Stream-buffer wraps averaged about 547 per five-second window; stream-path returns
+were zero. This stationary scene does not exercise transition-time invalidation.
+
+### Recommendation
+
+High exact-range reuse alone does not justify an exact-range-to-arena cache. The
+measured `GetArena` scope was only 0.622 ms/frame (about 6.6% of inclusive
+`ObtainBuffer`), or 26 ns/call under the intrusive profiler. A cache could skip only
+that lookup; residency, synchronization, write tracking, and caller-side access
+checks must still execute. Its plausible payoff is therefore small, while arena
+identity and mapping invalidation remain correctness hazards. Given the large
+observer effect and the low measured lookup cost, **do not implement Phase B yet**.
+
+The next step should be a lower-overhead measurement—e.g. sampled timing rather than
+clock reads and atomic updates on every buffer bind—then repeat the cost comparison.
+The larger apparent opportunity is synchronization (4.277 ms/frame, including a
+1.876 ms `ForEachUploadRange` traversal/tracking stage), which should be investigated
+with that cheaper probe. An
+exact-range cache should be reconsidered only if low-overhead measurements confirm
+material `GetArena` cost and a four-run, probe-free cache A/B demonstrates a repeatable
+FPS/frame-time gain without weakening backing-arena, mapping, or generation
+coherency. No Phase-B code has been implemented.
 
 ## Limits and artifacts
 

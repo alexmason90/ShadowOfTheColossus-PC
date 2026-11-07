@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: counters printed with the frame rate (SOTC_FPS=1, videoout/driver.cpp).
 #pragma once
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <vector>
@@ -230,6 +231,113 @@ inline uint64_t NowNs() {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 } ///< draws and dispatches recorded
+
+/// sotc: SOTC_BUFFER_PROFILE=1 enables BufferCache::ObtainBuffer stage timing, exact-range
+/// recurrence sampling, and backing/mapping invalidation counters. Diagnostic-only; the disabled
+/// path is a predictable branch and does not read the clock or update counters.
+inline const bool kBufferProfile = [] {
+    const char* v = std::getenv("SOTC_BUFFER_PROFILE");
+    return v && v[0] == '1';
+}();
+enum BufferProfileStage {
+    BufferObtain,
+    BufferArenaLookup,
+    BufferResidency,
+    BufferSynchronize,
+    BufferSyncRangeScan,
+    BufferSyncUpload,
+    BufferSyncImage,
+    BufferWriteTracking,
+    BufferProfileStages
+};
+inline std::atomic<uint64_t> buffer_stage_ns[BufferProfileStages]{};
+inline std::atomic<uint64_t> buffer_stage_calls[BufferProfileStages]{};
+inline std::atomic<uint64_t> buffer_range_calls{0}, buffer_range_repeats{0},
+    buffer_range_consecutive{0}, buffer_range_first{0}, buffer_range_collisions{0};
+inline std::atomic<uint64_t> buffer_stream_returns{0}, buffer_arena_creates{0},
+    buffer_arena_merges{0}, buffer_arena_page_rewrites{0}, buffer_resident_invalidations{0},
+    buffer_mapping_invalidations{0}, buffer_stream_wraps{0};
+struct BufferProfileTimer {
+    BufferProfileStage stage;
+    bool on;
+    uint64_t start;
+
+    explicit BufferProfileTimer(BufferProfileStage stage_, bool enabled = kBufferProfile)
+        : stage{stage_}, on{enabled}, start{on ? NowNs() : 0} {
+        if (on) {
+            buffer_stage_calls[stage].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    ~BufferProfileTimer() {
+        if (on) {
+            buffer_stage_ns[stage].fetch_add(NowNs() - start, std::memory_order_relaxed);
+        }
+    }
+};
+inline thread_local bool t_buffer_obtain_profile = false;
+struct BufferObtainProfileContext {
+    bool on;
+    bool previous;
+
+    explicit BufferObtainProfileContext(bool enabled = kBufferProfile)
+        : on{enabled}, previous{t_buffer_obtain_profile} {
+        if (on) {
+            t_buffer_obtain_profile = true;
+        }
+    }
+    ~BufferObtainProfileContext() {
+        if (on) {
+            t_buffer_obtain_profile = previous;
+        }
+    }
+};
+
+/// A bounded, per-thread direct-mapped sample. Exact matches are reliable repeat observations;
+/// collisions only cause false negatives, reported separately. This avoids an unbounded key set.
+inline void RecordBufferRange(uint64_t addr, uint32_t size, bool is_written, bool is_texel_buffer) {
+    if (!kBufferProfile) {
+        return;
+    }
+    struct Key {
+        uint64_t addr{};
+        uint32_t size{};
+        uint8_t flags{};
+        bool valid{};
+    };
+    static thread_local std::array<Key, 8192> seen{};
+    static thread_local Key previous{};
+    const uint8_t flags = static_cast<uint8_t>(is_written | (is_texel_buffer << 1));
+    const Key key{addr, size, flags, true};
+    uint64_t hash = addr ^ (uint64_t{size} * 0x9E3779B97F4A7C15ull) ^
+                    (uint64_t{flags} * 0xD6E8FEB86659FD93ull);
+    hash ^= hash >> 30;
+    hash *= 0xBF58476D1CE4E5B9ull;
+    hash ^= hash >> 27;
+    auto& slot = seen[hash & (seen.size() - 1)];
+    const bool same = slot.valid && slot.addr == key.addr && slot.size == key.size &&
+                      slot.flags == key.flags;
+    buffer_range_calls.fetch_add(1, std::memory_order_relaxed);
+    if (same) {
+        buffer_range_repeats.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        buffer_range_first.fetch_add(1, std::memory_order_relaxed);
+        if (slot.valid) {
+            buffer_range_collisions.fetch_add(1, std::memory_order_relaxed);
+        }
+        slot = key;
+    }
+    if (previous.valid && previous.addr == key.addr && previous.size == key.size &&
+        previous.flags == key.flags) {
+        buffer_range_consecutive.fetch_add(1, std::memory_order_relaxed);
+    }
+    previous = key;
+}
+
+inline void NoteBufferResidentInvalidation() {
+    if (kBufferProfile) {
+        buffer_resident_invalidations.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 /// sotc: SOTC_DRAW_SPLIT=1 (with SOTC_FPS): where the draw thread's time goes, the "SOTC DRAW
 /// SPLIT" lines (videoout/driver.cpp; step 0 of docs/sotc/PLANO-THREAD-DESENHO.md). "draw busy"

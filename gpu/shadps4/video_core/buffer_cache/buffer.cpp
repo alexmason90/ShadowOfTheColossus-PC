@@ -10,6 +10,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
 
@@ -222,6 +223,9 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
         current_watch_cursor = 0;
         offset = 0;
         ++wrap_generation;
+        if (SotcStats::kBufferProfile) {
+            SotcStats::buffer_stream_wraps.fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Swap watches and reset waiting cursors.
         std::swap(previous_watches, current_watches);

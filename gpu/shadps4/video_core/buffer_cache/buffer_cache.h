@@ -158,9 +158,7 @@ public:
     bool ReadClean(VAddr addr, void* out, u32 size);
 
     /// A GPU mapping changed: cached backing pointers may be stale. Any thread.
-    void OnMappingChanged() {
-        clean_map_generation.fetch_add(1, std::memory_order_release);
-    }
+    void OnMappingChanged();
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
