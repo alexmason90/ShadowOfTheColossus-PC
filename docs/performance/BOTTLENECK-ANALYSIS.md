@@ -91,14 +91,17 @@ the sum as frame latency. Their similar costs at the two render sizes support a
 substantial host-side workload that is not proportional to pixel count.
 
 Draw-thread elapsed-time subcounters further locate work, but are nested/inclusive
-and should not be summed as independent costs. Typical medians were about 9.5 ms per
-frame in resource binding, including about 4.0 ms in `BufferCache::ObtainBuffer`;
-draw/indirect/dispatch work was also substantial. Descriptor push recording was
-about 0.4 ms/frame, descriptor updates were near zero, and `vkQueueSubmit` was about
-0.6 ms/frame. Draw-thread waits for GPU, submit, recorder and frame were near zero.
-The CP-to-draw queue reached its 512-entry capacity in settled profile windows,
-indicating queue pressure, though this maximum alone does not identify which thread
-sets the frame rate.
+and should not be summed as independent costs. The counter labeled `obtain` was about
+4.0 ms/frame inside roughly 9.5 ms/frame of resource binding. It is a wall-elapsed
+timer, not thread CPU time or a range-lookup-only measurement: its scope begins before
+`BufferCache::ObtainBuffer` and extends past the return through caller-side offset
+alignment, descriptor bookkeeping, optional write invalidation, and
+`Runtime::IsBufferAccessed`. Draw/indirect/dispatch work was also substantial.
+Descriptor push recording was about 0.4 ms/frame, descriptor updates were near zero,
+and `vkQueueSubmit` was about 0.6 ms/frame. Draw-thread waits for GPU, submit,
+recorder and frame were near zero. The CP-to-draw queue reached its 512-entry
+capacity in settled profile windows, indicating queue pressure, though this maximum
+alone does not identify which thread sets the frame rate.
 
 Guest-thread readback-wait telemetry was about 12.8 ms/frame in aggregate and mostly
 attributed to GPU waits. It can overlap other guest and renderer work, so it is not
@@ -120,23 +123,67 @@ leans away from a fully saturated GPU as the only limiter. GPU execution still
 occupies a meaningful portion of the measured window, so this is best described as
 a **host-heavy or mixed limit**, not a proven CPU-only limit.
 
-## One scoped optimization experiment
+## `ObtainBuffer` phase-A review
 
-Test a conservative, opt-in fast path for repeated
-`BufferCache::ObtainBuffer` range lookups. The measured lookup subcounter is about
-4 ms/frame inside the larger binding interval, making it a specific lead rather
-than a guess based on descriptor-update cost. First record repeated-key and
-invalidation rates. If reuse exists, prototype an exact-range cache valid only
-while the relevant buffer/cache generation is unchanged; do not skip upload,
-residency, or memory-tracking work unless the existing invariants prove it safe.
+The source path shows why the existing `obtain` figure cannot be attributed to key
+lookup:
 
-Compare default versus experimental mode in a four-run interleaved ABBA at 1080p
-with the same scene and probe-free FPS harness. Report native FPS and p50/p95/p99;
-run the detailed profile separately. Require image/correctness checks and a
-repeatable improvement in both median FPS and tail frame times before keeping the
-change. If key reuse is rare, abandon this target rather than broadening the cache
-or changing synchronization speculatively. **No game optimization is implemented
-by this analysis.**
+1. A configurable small-read-only streaming branch checks GPU-modified state, copies
+   guest bytes to the stream buffer, commits it, and returns. Its default size
+   threshold is zero, but it remains a distinct path when enabled.
+2. The normal path computes the covered blocks and calls `GetArena`. The stable
+   mapping case uses a few constant-time `address_space` table reads; missing or
+   split mappings can create or merge arena objects and rewrite page-to-arena
+   pointers.
+3. `EnsureResident` handles overlapping pending releases, resident-range lookup and
+   use stamping. On misses it can allocate/bind sparse memory and update the BDA
+   page table. It already has a direct-mapped resident-range cache, keyed by first
+   block and `resident_version` (64 slots by default, 1024 with the wide-cache
+   setting); this is not an exact `(address, size, flags)` result cache.
+4. `SynchronizeMemory` scans the memory tracker for CPU-dirty upload ranges. If any
+   exist, it requests staging, copies guest bytes, flushes and records a Vulkan copy,
+   and records the writes. Read-only texel buffers may additionally synchronize an
+   aliased image.
+5. Writable ranges additionally call `NoteHostWrite`, `AddGpuModified` (including
+   in-flight-readback and clean-page tracking), and `RecordCurrentWrite`.
+
+The existing profiles do **not** give separate timings for these stages, exact-range
+key frequency (consecutive or within a frame), unique-key counts, or generation and
+arena invalidation rates. None of those values can be inferred from the 4.0 ms
+inclusive caller timer or from the resident cache's own hit path.
+
+Source review identifies invalidation concerns for any future cache. Resident-range
+additions, releases and cold evictions advance `resident_version`; `GetArena` can
+rewrite `address_space` pointers during arena creation/merge, so a new cache of arena
+pointers must explicitly account for those rewrites rather than assuming
+`resident_version` alone covers every identity change. `OnMappingChanged` advances
+`clean_map_generation`; `StreamGeneration` applies to transient stream-buffer
+storage. A cached result must also exclude the stream-buffer return path. Regardless
+of a lookup hit, `EnsureResident`, `SynchronizeMemory`, GPU-write tracking and the
+caller-side access/barrier checks must continue to run.
+
+### Phase-A execution status and Phase-B gate
+
+The existing report contains a prior four-run probe-free 1080p reference (46.80 FPS;
+per-window p50/p95/p99 of 21.35/24.55/27.10 ms). It is preserved reference data, not
+a new baseline run for this follow-up. A fresh current-source build and run could not
+be made in this environment: CMake, Ninja and Vulkan development headers are
+unavailable. Therefore no claim is made that the current instrumentation was built
+or linked here, and no new stage timings, exact-key repetition counts, or
+invalidation frequencies are reported. Phase A is incomplete; Phase B has not
+started, and no cache optimization has been implemented.
+
+After a complete Linux build environment is available, add only opt-in aggregate
+probes for the stages above and count exact-key calls, distinct keys and repeat hits
+without per-call logging. Record arena/page-map and relevant generation changes
+separately. Proceed to an opt-in exact-range lookup experiment only if those data
+show both substantial reuse and material lookup cost. Verify every hit against the
+existing path and conservatively invalidate on any backing-arena, mapping, or
+generation change. Then compare default and experiment with four interleaved runs
+per variant at 1080p, probe-free for FPS, and separate diagnostic runs. Require
+correctness checks and repeatable improvement in native FPS and p50/p95/p99; reject
+the experiment if lookup is not material, reuse is rare, or coherence cannot be
+preserved. **No optimization is justified by the available measurements.**
 
 ## Limits and artifacts
 
