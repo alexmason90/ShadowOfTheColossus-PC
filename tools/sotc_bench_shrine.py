@@ -35,9 +35,53 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'scripts'))
 from sotc_modes import game_serial, save_template  # noqa: E402
+from sotc_launch_env import native_runtime_defaults  # noqa: E402
 GAME = os.environ.get('SOTC_GAME_DIR', str(Path(__file__).resolve().parents[2] / 'CUSA08809'))
 IDLE_LOW, IDLE_HIGH, IDLE_SPREAD, IDLE_SAMPLES = 5500, 6400, 300, 3
 FPS_LINE = re.compile(r'SOTC FPS ([\d.]+) at (\d+)s; (\d+) cmds/frame')
+# page_manager.cpp emits this when a protected range overlaps registered guest stacks;
+# it subtracts those pages and protects the remaining ranges, so this exact diagnostic is not fatal.
+GUEST_STACK_EXCLUSION_RE = re.compile(
+    r'(?im)^.*<Error> page_manager\.cpp:\d+ Protect: Not protecting guest stack pages '
+    r'in 0x[0-9a-f]+\+0x[0-9a-f]+\s*$')
+FATAL_LOG_RE = re.compile(
+    r'(?im)(assert(?:ion)?\s+failed|^Fault\b|^STOP:|Prepared draw descriptor mismatch|'
+    r'VK_ERROR_|<Critical>)')
+
+
+def find_correctness_failure(log_text):
+    filtered = GUEST_STACK_EXCLUSION_RE.sub('', log_text)
+    return FATAL_LOG_RE.search(filtered)
+
+
+def build_probe_environment(base_env, out, reference=None, overrides=()):
+    """Build the actual probe environment, including policy normally applied by sotc.py."""
+    env = dict(base_env)
+    msys = env.get('MSYS2_ROOT', r'C:\msys64')
+    env['PATH'] = str(Path(msys) / 'clang64' / 'bin') + os.pathsep + env.get('PATH', '')
+    env.update(BB_FRAME_DUMP_TRIGGER=str(out / 'dump.trigger'), BB_DUMP_DIR=str(out / 'dump'),
+               BB_PAD_FILE=str(out / 'pad.txt'), BB_STACKS_TRIGGER=str(out / 'stacks.trigger'),
+               BB_VBLANK_HZ='120', SOTC_FPS='1', SOTC_SAVE_PROMPT='auto')
+    if reference is not None:
+        settings = str(reference / 'recclock-1080-B-01.ini')
+        env.update(
+            SOTC_GAME_DIR=GAME, SOTC_USER_DIR=str(out / 'user'), BB_GPU_USER_DIR=str(out / 'user'),
+            SOTC_CONFIG=settings, BB_CONFIG=settings,
+            SOTC_MODES='af16,fps60game',
+            SOTC_CVARS='doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0 skipSplash=1 nointro r_motionBlurEnable=0',
+            SOTC_FPS_CAP='off', SOTC_FPS_LIMIT='0', SOTC_FRAMEGEN='off', SOTC_LINUX_PERF='1',
+            SOTC_RENDER_RES='1920x1080', SOTC_MOUSE='0', SOTC_PREPARED_DRAW='0',
+            SOTC_PREPARED_DRAW_LAZY='0', SOTC_PREPARED_DRAW_LAZY_DIRECT='0',
+            SOTC_PREPARED_DRAW_VERIFY='0', SOTC_PIPE_KEY_MEMO='0', SOTC_REC_CLOCK_BATCH='1',
+            SOTC_REC_SPIN_US='250', SOTC_REC_SLEEP_US='500',
+            BB_GAMEPAD='__benchmark__', BB_PRESENT_MODE='Mailbox',
+            LD_PRELOAD=str(reference / 'input_lock.so'), PYTHONUNBUFFERED='1')
+    for item in overrides:
+        name, value = item.split('=', 1)
+        env[name] = value
+    # Overrides precede setdefault: an explicitly disabled optimization stays disabled.
+    native_runtime_defaults(env)
+    return env
 
 
 def main():
@@ -50,6 +94,10 @@ def main():
     parser.add_argument('--cmdline', default='out/bench.cmdline')
     parser.add_argument('--shots', type=int, default=3, help='frames dumped during the measurement')
     parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/ or CUSA08034/')
+    parser.add_argument('--reference-b01', action='store_true',
+                        help='use the isolated B-01 reference assets/config and neutral input')
+    parser.add_argument('--run-root', type=Path,
+                        help='isolated root containing reference-b01/ and out/; required for B-01')
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
     parser.add_argument('--after-load', type=float, metavar='SECONDS',
@@ -62,6 +110,9 @@ def main():
                              'exactly the same spot every run: tapping Cross mounts him once in reach '
                              '(and kicks him once mounted, as the recorded route does).')
     args = parser.parse_args()
+    run_root = args.run_root.resolve() if args.run_root else ROOT
+    if args.reference_b01 and (args.run_root is None or run_root.is_relative_to(ROOT)):
+        parser.error('--reference-b01 requires --run-root outside the source directory')
     replay_seconds = 0.0
     if args.replay:
         lines = [l.split() for l in Path(args.replay).read_text().splitlines() if l.strip()]
@@ -78,8 +129,18 @@ def main():
         args.timeout = max(args.timeout, 200 + replay_seconds)
     if args.record:
         args.timeout = max(args.timeout, 3600)
-    os.chdir(ROOT)
+    if args.reference_b01:
+        # B-01 launched directly into the saved Shrine scene; do not run the title-screen
+        # controller script against the already-neutral benchmark input.
+        # Isolated wrappers clear SOTC_* variables; the run root may name the dump instead.
+        global GAME
+        game_file = run_root / 'reference-b01' / 'game_dir.txt'
+        if 'SOTC_GAME_DIR' not in os.environ and game_file.is_file():
+            GAME = game_file.read_text().strip()
+    os.chdir(run_root)
     out = Path('out')
+    reference = run_root / 'reference-b01'
+    prepared = reference / 'prepared' if args.reference_b01 else out
     serial = game_serial(GAME)  # CUSA08809 (EU) or CUSA08034 (US): the folder the game saves in
     template = save_template(args.template, serial)
     if not template:
@@ -91,28 +152,35 @@ def main():
     shutil.rmtree(out / 'dump', ignore_errors=True)
     (out / 'dump').mkdir(parents=True)
     pad = out / 'pad.txt'
-    pad.write_text('')
-    env = dict(os.environ)
-    msys = os.environ.get('MSYS2_ROOT', r'C:\msys64')
-    env['PATH'] = str(Path(msys) / 'clang64' / 'bin') + os.pathsep + env['PATH']
-    env.update(BB_FRAME_DUMP_TRIGGER=str(out / 'dump.trigger'), BB_DUMP_DIR=str(out / 'dump'), BB_PAD_FILE=str(pad),
-               BB_STACKS_TRIGGER=str(out / 'stacks.trigger'), BB_VBLANK_HZ='120', SOTC_FPS='1',
-               SOTC_SAVE_PROMPT='auto')  # sotc: unattended runs never wait on a save prompt
-    for item in args.env:
-        name, value = item.split('=', 1)
-        env[name] = value
+    pad.write_text((reference / 'neutral.pad').read_text() if args.reference_b01 else '')
+    env = build_probe_environment(os.environ, out, reference if args.reference_b01 else None,
+                                  args.env)
     if args.record:
         env['BB_PAD_RECORD'] = str(Path(args.record).resolve())
     if args.replay:
         env['BB_PAD_REPLAY'] = str(Path(args.replay).resolve())
-    command = [str(out / 'bb-probe.exe'), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
-               '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--app0', GAME, '--user', str(out / 'user'),
-               '--patches', args.patches, '--sotc-cmdline', args.cmdline]
+    patches = str(reference / 'prepared' / 'patches.bin') if args.reference_b01 else args.patches
+    cmdline = str(reference / 'prepared' / 'cmdline.bin') if args.reference_b01 else args.cmdline
+    command = [str(out / 'bb-probe.exe'), str(prepared / 'boot-linked.bin'), '--content-profile', str(prepared / 'content.bin'),
+               '--sotc-cpu', str(prepared / 'sotc-cpu.bin'), '--app0', GAME, '--user', str(out / 'user'),
+               '--patches', patches, '--sotc-cmdline', cmdline,
+               # Disable the probe's independent 10-second SIGALRM; args.timeout below remains
+               # the benchmark's outer deadline, matching the Linux launcher (sotc.py).
+               '--timeout', '0']
+    report_keys = ('BB_DMEM_MB', 'BB_VBLANK_HZ', 'SOTC_RB_HOT', 'SOTC_GUARD_STALE',
+                   'SOTC_GUARD_USER_POINTER', 'SOTC_RELEASE_DEFER', 'SOTC_IMAGE_DEDICATED',
+                   'SOTC_PIPE_KEY_MEMO', 'SOTC_PREPARED_DRAW', 'SOTC_PREPARED_DRAW_LAZY',
+                   'SOTC_PREPARED_DRAW_LAZY_DIRECT', 'SOTC_PREPARED_DRAW_VERIFY',
+                   'SOTC_REC_CLOCK_BATCH', 'SOTC_REC_SPIN_US', 'SOTC_REC_SLEEP_US')
+    print('Probe environment: ' + ' '.join(f'{key}={env.get(key, "unset")}'
+                                         for key in report_keys), flush=True)
     log = open(args.log, 'wb')
     process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     start = time.monotonic()
     started = time.time()
-    state = {'idle_at': None, 'stop': False, 'game_starts': 0, 'gameplay_at': None}
+    state = {'idle_at': None, 'stop': False, 'game_starts': 0,
+             'gameplay_at': 0.0 if args.reference_b01 else None,
+             'failure': None, 'measurement_complete': False}
     samples = []  # (fps, cmds, arrival seconds)
 
     def press(what, hold=0.25, until=None):
@@ -168,6 +236,12 @@ def main():
                 text = Path(args.log).read_text(encoding='utf-8', errors='replace')
             except OSError:
                 continue
+            failure = find_correctness_failure(text)
+            if failure:
+                state['failure'] = failure.group(0)
+                state['stop'] = True
+                process.terminate()
+                return
             state['game_starts'] = text.count('st_gameflow() starting game')
             for match in FPS_LINE.finditer(text, seen):
                 seen = match.end()
@@ -180,11 +254,12 @@ def main():
                         max(IDLE_SPREAD, 0.06 * max(s[1] for s in recent))):
                     state['idle_at'] = time.monotonic() - start
 
-    threading.Thread(target=route, daemon=True).start()
+    if not args.reference_b01:
+        threading.Thread(target=route, daemon=True).start()
     threading.Thread(target=follow_log, daemon=True).start()
     shot_times = []
     handed_over = False
-    while process.poll() is None and time.monotonic() - start < args.timeout:
+    while process.poll() is None and time.monotonic() - start < args.timeout and not state.get('failure'):
         idle_at = state['idle_at']
         # Recordings and replays start on the same fixed trigger, 1 s after the shrine cutscene
         # skip hands over control (Agro has not started wandering yet), not on the settled-camera
@@ -232,6 +307,7 @@ def main():
                 if not shot_times:
                     shot_times = [float('inf')]
             if now >= idle_at + 5 + args.measure:
+                state['measurement_complete'] = True
                 break
         time.sleep(0.1)
     state['stop'] = True
@@ -239,11 +315,17 @@ def main():
         process.kill()
         process.wait()
     log.close()
+    if state.get('failure'):
+        print(f"FAIL: correctness marker detected: {state['failure']}")
+        return 1
+    if not args.record and not state.get('measurement_complete') and process.returncode is not None:
+        print(f"FAIL: runner exited before measurement completed, rc={process.returncode}")
+        return 1
     raws = sorted((out / 'dump').glob('output_*.raw'))
     if raws:
         subprocess.run([sys.executable, str(ROOT / 'tools' / 'raw2png.py'), *map(str, raws)], stdout=subprocess.DEVNULL)
     # The trigger saves PNG screenshots in the user screenshots folder (as tools/sotc_play.py).
-    shots = sorted(p for d in (ROOT / 'user' / 'screenshots', out / 'user' / 'screenshots') if d.is_dir()
+    shots = sorted(p for d in (run_root / 'user' / 'screenshots', out / 'user' / 'screenshots') if d.is_dir()
                    for p in d.glob('*.png') if p.stat().st_mtime >= started)
     for i, shot in enumerate(shots):
         shutil.copy(shot, out / 'dump' / f'output_{i:03d}_shot.png')
@@ -260,6 +342,10 @@ def main():
             pass
     # Final pass over the whole log (the follower may have missed the last lines).
     text = Path(args.log).read_text(encoding='utf-8', errors='replace')
+    failure = find_correctness_failure(text)
+    if failure:
+        print(f'FAIL: correctness marker detected: {failure.group(0)}')
+        return 1
     print(' '.join(f'{m.group(1)}@{m.group(2)}' for m in FPS_LINE.finditer(text)))
     idle_at = state['idle_at']
     if idle_at is None:

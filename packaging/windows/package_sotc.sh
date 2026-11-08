@@ -69,7 +69,7 @@ else
     echo "AMD FSR: no FSR SDK in $amd_fsr (FSR 1 instead of FSR 4)" >&2
 fi
 cp scripts/prepare.py scripts/link_libc.py scripts/link_modules.py scripts/content_profile.py \
-   scripts/sotc_cpu.py scripts/sotc_modes.py "$dest/scripts/"
+   scripts/sotc_cpu.py scripts/sotc_modes.py scripts/sotc_launch_env.py "$dest/scripts/"
 cp sotc.py SotC.bat LICENSE CHANGELOG.md "$dest/"
 cp docs/sotc/README-SotC.md "$dest/README.md"
 cat > "$dest/sotc.ini" <<'EOF'

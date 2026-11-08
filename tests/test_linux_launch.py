@@ -90,6 +90,9 @@ class LinuxLaunchTests(unittest.TestCase):
                     self.assertEqual(command[-6:], ['--user', str(data), '--timeout', '0', '--timeout', '1'])
                     self.assertEqual(os.environ['BB_CONFIG'], str(config))
                     self.assertEqual(os.environ['BB_GPU_USER_DIR'], str(data))
+                    self.assertEqual(os.environ['BB_DMEM_MB'], '9152')
+                    self.assertEqual(os.environ['BB_VBLANK_HZ'], '120')
+                    self.assertEqual(os.environ['SOTC_RELEASE_DEFER'], '1')
                     self.assertFalse((app / 'out').exists())
                     self.assertTrue((data / 'prepared/prepared.txt').exists())
             finally:

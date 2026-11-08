@@ -38,6 +38,8 @@ import shutil
 import subprocess
 import sys
 
+from scripts.sotc_launch_env import linux_performance_defaults, native_runtime_defaults
+
 PORT = Path(__file__).resolve().parent
 SCRIPTS = PORT / 'scripts'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
@@ -145,25 +147,12 @@ def merged_source(game, update, out):
     return merged
 
 
-def linux_performance_defaults(env):
-    """Windows launcher's established fast paths, with explicit overrides preserved."""
-    if os.name == 'nt' or env.get('SOTC_LINUX_PERF', '1') != '1':
-        return
-    defaults = {
-        'SOTC_RB_HOT': '1', 'SOTC_GUARD_STALE': '1',
-        'SOTC_GUARD_USER_POINTER': '1', 'SOTC_RELEASE_DEFER': '1',
-        'SOTC_IMAGE_DEDICATED': '1', 'BB_PRESENT_MODE': 'Mailbox',
-    }
-    for key, value in defaults.items():
-        env.setdefault(key, value)
-
-
 def main():
     load_ini()
     if os.name != 'nt':
         config_file().parent.mkdir(parents=True, exist_ok=True)
     env = os.environ
-    linux_performance_defaults(env)
+    native_runtime_defaults(env)
     if os.name != 'nt':
         env['SOTC_PYTHON'] = sys.executable
         env['SOTC_LAUNCH_SCRIPT'] = str(PORT / 'sotc.py')
@@ -242,18 +231,6 @@ def main():
             same_aspect = False
         if not same_aspect:
             env['SOTC_OUTPUT_RES'] = render
-        # Larger render targets: the game's heaps take what direct memory there is (run.sh).
-        env.setdefault('BB_DMEM_MB', '9152')
-    # The game's direct memory allocator (a 64 KiB page bitmap over all of it) filled up and read
-    # past the bitmap (guest offset 0x1a371, read of -1): in PS4 Pro mode with 5696 MiB when a save
-    # loaded, and in PS4 mode with 5056 MiB on loading the last colossus' area (user logs, 19
-    # Oct; high quality textures keep more fine mips resident than on a PS4). Every mode gets the
-    # 9152 MiB the wide render sizes already used.
-    env.setdefault('BB_DMEM_MB', '9152')
-    # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
-    # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
-    # in 120 Hz vblanks).
-    env.setdefault('BB_VBLANK_HZ', '120')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
