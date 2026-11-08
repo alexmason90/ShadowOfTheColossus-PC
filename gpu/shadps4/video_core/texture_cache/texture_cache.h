@@ -161,8 +161,18 @@ private:
         static thread_local char token;
         return &token;
     }
-    /// FlushProcessWriteBuffers on Windows, a full fence elsewhere (texture_cache.cpp).
+    /// FlushProcessWriteBuffers on Windows; on Linux membarrier(PRIVATE_EXPEDITED) when
+    /// AsymmetricFenceAvailable(), else a full fence (texture_cache.cpp).
     static void AsymmetricBarrier();
+    /// sotc: Linux: true when membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED) is registered for this
+    /// process (SOTC_TC_MEMBARRIER=0 disables it). Decided once; the biased owner and the
+    /// announcing threads read the same answer, so the owner's fast path may drop its full fence
+    /// exactly when the other side's barrier makes up for it. Always false on Windows (unused).
+    static bool AsymmetricFenceAvailable() {
+        static const bool on = InitAsymmetricFence();
+        return on;
+    }
+    static bool InitAsymmetricFence();
     static void Pause(u32& spins) {
         if (++spins < 4096) {
             __builtin_ia32_pause();
@@ -175,7 +185,14 @@ private:
 #ifdef _WIN32
         std::atomic_signal_fence(std::memory_order_seq_cst); // the barrier is on the other side
 #else
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // sotc: the locked fence drains the draw thread's store buffer on each of its ~15,000
+        // batch holds per frame (~9% of GpuDraw's samples landed just after BatchLock at the
+        // Shrine); with membarrier the other side pays instead, like FlushProcessWriteBuffers.
+        if (AsymmetricFenceAvailable()) {
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+        } else {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
 #endif
         if (slow_wants.load(std::memory_order_acquire) == 0) {
             return true;

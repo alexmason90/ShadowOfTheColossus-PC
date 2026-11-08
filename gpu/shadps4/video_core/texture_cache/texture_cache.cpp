@@ -6,6 +6,11 @@
 #include <cstring>
 #include <cstdio>
 #include <unordered_set>
+#ifndef _WIN32
+#include <linux/membarrier.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <stb_image.h>
 #include "common/path_util.h"
 #ifdef _WIN32
@@ -43,11 +48,41 @@ extern "C" void runtime_write_fault_dump(uintptr_t start, uint64_t size) __attri
 
 namespace VideoCore {
 
+#ifndef _WIN32
+// sotc: membarrier(2) PRIVATE_EXPEDITED runs a full barrier on every running thread of this
+// process before it returns (Linux 4.14+), the guarantee FlushProcessWriteBuffers gives on Windows.
+bool ReentrantMutex::InitAsymmetricFence() {
+    const char* v = std::getenv("SOTC_TC_MEMBARRIER");
+    if (v && v[0] == '0') {
+        return false;
+    }
+    const long cmds = syscall(SYS_membarrier, MEMBARRIER_CMD_QUERY, 0, 0);
+    if (cmds < 0 || !(cmds & MEMBARRIER_CMD_PRIVATE_EXPEDITED) ||
+        syscall(SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) != 0) {
+        std::fprintf(stderr, "TextureCache: membarrier unavailable, the lock keeps its fence\n");
+        return false;
+    }
+    return true;
+}
+#else
+bool ReentrantMutex::InitAsymmetricFence() {
+    return false;
+}
+#endif
+
 void ReentrantMutex::AsymmetricBarrier() {
 #ifdef _WIN32
     FlushProcessWriteBuffers();
 #else
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (AsymmetricFenceAvailable()) {
+        // Registered: it cannot fail, and the owner's fast path relies on it.
+        if (syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) != 0) {
+            std::perror("TextureCache: membarrier");
+            std::abort();
+        }
+    } else {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
 #endif
 }
 

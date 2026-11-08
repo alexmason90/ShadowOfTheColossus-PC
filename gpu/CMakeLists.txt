@@ -381,3 +381,10 @@ target_include_directories(buffer-format-10-11-11-test PRIVATE shim shadps4 thir
     third_party/sirit/externals/SPIRV-Headers/include)
 target_compile_options(buffer-format-10-11-11-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(buffer-format-10-11-11-test PRIVATE bbgpu)
+
+# sotc: texture cache lock (biased owner + announcing threads, membarrier on Linux).
+add_executable(texture-cache-lock-test EXCLUDE_FROM_ALL ../tests/test_texture_cache_lock.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(texture-cache-lock-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(texture-cache-lock-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(texture-cache-lock-test PRIVATE bbgpu)
