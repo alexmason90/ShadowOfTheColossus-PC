@@ -409,6 +409,22 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
         return FoldInverseFunc(inst, IR::Opcode::UnpackUfloat10_11_11);
     case IR::Opcode::UnpackUfloat10_11_11:
         return FoldInverseFunc(inst, IR::Opcode::PackUfloat10_11_11);
+    case IR::Opcode::PackUnorm10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::UnpackUnorm10_11_11);
+    case IR::Opcode::UnpackUnorm10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::PackUnorm10_11_11);
+    case IR::Opcode::PackSnorm10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::UnpackSnorm10_11_11);
+    case IR::Opcode::UnpackSnorm10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::PackSnorm10_11_11);
+    case IR::Opcode::PackUint10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::UnpackUint10_11_11);
+    case IR::Opcode::UnpackUint10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::PackUint10_11_11);
+    case IR::Opcode::PackSint10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::UnpackSint10_11_11);
+    case IR::Opcode::UnpackSint10_11_11:
+        return FoldInverseFunc(inst, IR::Opcode::PackSint10_11_11);
     // 2_10_10_10
     case IR::Opcode::PackUnorm2_10_10_10:
         return FoldInverseFunc(inst, IR::Opcode::UnpackUnorm2_10_10_10);

@@ -193,6 +193,84 @@ Id EmitUnpackUfloat10_11_11(EmitContext& ctx, Id value) {
     return ctx.OpCompositeConstruct(ctx.F32[3], cvt_x, cvt_y, cvt_z);
 }
 
+// sotc: non-float 10_11_11 conversions (X bits 0-10, Y 11-21, Z 22-31).
+static Id PackThreeFields(EmitContext& ctx, Id x, Id y, Id z) {
+    // InsertBitFields uses the first value as its initial word, so mask that field explicitly.
+    const auto low{ctx.OpBitwiseAnd(ctx.U32[1], x, ctx.ConstU32(0x7ffU))};
+    return InsertBitFields(ctx, {low, y, z}, R(0, 11), R(11, 11), R(22, 10));
+}
+
+Id EmitPackUnorm10_11_11(EmitContext& ctx, Id value) {
+    const auto [x, y, z] = ExtractComposite<3>(ctx, ctx.F32, value);
+    const auto to_unorm = [&](Id component, u32 maximum) {
+        const auto clamped{ctx.OpFClamp(ctx.F32[1], component, ctx.ConstF32(0.f),
+                                        ctx.ConstF32(1.f))};
+        const auto scaled{ctx.OpFMul(ctx.F32[1], clamped, ctx.ConstF32(static_cast<float>(maximum)))};
+        return ctx.OpConvertFToU(ctx.U32[1], ctx.OpRoundEven(ctx.F32[1], scaled));
+    };
+    return PackThreeFields(ctx, to_unorm(x, 0x7ffU), to_unorm(y, 0x7ffU),
+                           to_unorm(z, 0x3ffU));
+}
+
+Id EmitUnpackUnorm10_11_11(EmitContext& ctx, Id value) {
+    const auto [x, y, z] = ExtractBitFields<false>(ctx, value, R(0, 11), R(11, 11), R(22, 10));
+    const auto to_float = [&](Id component, u32 maximum) {
+        return ctx.OpFDiv(ctx.F32[1], ctx.OpConvertUToF(ctx.F32[1], component),
+                          ctx.ConstF32(static_cast<float>(maximum)));
+    };
+    return ctx.OpCompositeConstruct(ctx.F32[3], to_float(x, 0x7ffU), to_float(y, 0x7ffU),
+                                    to_float(z, 0x3ffU));
+}
+
+Id EmitPackSnorm10_11_11(EmitContext& ctx, Id value) {
+    const auto [x, y, z] = ExtractComposite<3>(ctx, ctx.F32, value);
+    const auto to_snorm = [&](Id component, u32 maximum) {
+        const auto clamped{ctx.OpFClamp(ctx.F32[1], component, ctx.ConstF32(-1.f),
+                                        ctx.ConstF32(1.f))};
+        const auto scaled{ctx.OpFMul(ctx.F32[1], clamped, ctx.ConstF32(static_cast<float>(maximum)))};
+        const auto signed_value{
+            ctx.OpConvertFToS(ctx.S32[1], ctx.OpRoundEven(ctx.F32[1], scaled))};
+        return ctx.OpBitcast(ctx.U32[1], signed_value);
+    };
+    return PackThreeFields(ctx, to_snorm(x, 0x3ffU), to_snorm(y, 0x3ffU),
+                           to_snorm(z, 0x1ffU));
+}
+
+Id EmitUnpackSnorm10_11_11(EmitContext& ctx, Id value) {
+    const auto [x, y, z] = ExtractBitFields<true>(ctx, value, R(0, 11), R(11, 11), R(22, 10));
+    const auto signed_fields{ctx.OpBitcast(ctx.S32[3],
+                                           ctx.OpCompositeConstruct(ctx.U32[3], x, y, z))};
+    const auto signed_float{ctx.OpConvertSToF(ctx.F32[3], signed_fields)};
+    const auto divisors{ctx.ConstantComposite(ctx.F32[3], ctx.ConstF32(1023.f),
+                                               ctx.ConstF32(1023.f), ctx.ConstF32(511.f))};
+    const auto normalized{ctx.OpFDiv(ctx.F32[3], signed_float, divisors)};
+    const auto lower{ctx.ConstantComposite(ctx.F32[3], ctx.ConstF32(-1.f), ctx.ConstF32(-1.f),
+                                           ctx.ConstF32(-1.f))};
+    const auto upper{ctx.ConstantComposite(ctx.F32[3], ctx.ConstF32(1.f), ctx.ConstF32(1.f),
+                                           ctx.ConstF32(1.f))};
+    return ctx.OpFClamp(ctx.F32[3], normalized, lower, upper);
+}
+
+Id EmitPackUint10_11_11(EmitContext& ctx, Id value) {
+    const auto unpacked{ctx.OpBitcast(ctx.U32[3], value)};
+    const auto [x, y, z] = ExtractComposite<3>(ctx, ctx.U32, unpacked);
+    return PackThreeFields(ctx, x, y, z);
+}
+
+Id EmitUnpackUint10_11_11(EmitContext& ctx, Id value) {
+    const auto [x, y, z] = ExtractBitFields<false>(ctx, value, R(0, 11), R(11, 11), R(22, 10));
+    return ctx.OpBitcast(ctx.F32[3], ctx.OpCompositeConstruct(ctx.U32[3], x, y, z));
+}
+
+Id EmitPackSint10_11_11(EmitContext& ctx, Id value) {
+    return EmitPackUint10_11_11(ctx, value);
+}
+
+Id EmitUnpackSint10_11_11(EmitContext& ctx, Id value) {
+    const auto [x, y, z] = ExtractBitFields<true>(ctx, value, R(0, 11), R(11, 11), R(22, 10));
+    return ctx.OpBitcast(ctx.F32[3], ctx.OpCompositeConstruct(ctx.U32[3], x, y, z));
+}
+
 Id EmitPackUnorm2_10_10_10(EmitContext& ctx, Id value) {
     const auto unorm_min{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(0.f), ctx.ConstF32(0.f),
                                                ctx.ConstF32(0.f), ctx.ConstF32(0.f))};

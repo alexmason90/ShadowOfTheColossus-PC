@@ -369,3 +369,15 @@ add_executable(prepared-draw-test EXCLUDE_FROM_ALL ../tests/test_prepared_draw.c
 target_compile_options(prepared-draw-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(prepared-draw-test PRIVATE shim shadps4)
 target_link_libraries(prepared-draw-test PRIVATE fmt::fmt)
+
+add_executable(pixel-format-test EXCLUDE_FROM_ALL ../tests/test_pixel_format.cpp)
+target_compile_options(pixel-format-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(pixel-format-test PRIVATE shim shadps4)
+target_link_libraries(pixel-format-test PRIVATE fmt::fmt)
+
+add_executable(buffer-format-10-11-11-test EXCLUDE_FROM_ALL
+    ../tests/test_buffer_format_10_11_11.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(buffer-format-10-11-11-test PRIVATE shim shadps4 third_party/gcn/include
+    third_party/sirit/externals/SPIRV-Headers/include)
+target_compile_options(buffer-format-10-11-11-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(buffer-format-10-11-11-test PRIVATE bbgpu)

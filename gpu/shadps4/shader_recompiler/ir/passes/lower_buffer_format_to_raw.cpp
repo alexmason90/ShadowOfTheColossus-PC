@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/log.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -196,6 +197,47 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
     const auto buffer{desc.GetSharp(info)};
 
     const auto is_inst_typed = flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
+    // sotc: fail with the shader identity on 10_11_11 formats that have no conversion.
+    const auto requested_data_format =
+        is_inst_typed ? flags.inst_data_fmt.Value() : AmdGpu::DataFormat(buffer.data_format);
+    const auto requested_number_format =
+        is_inst_typed ? flags.inst_num_fmt.Value() : AmdGpu::NumberFormat(buffer.num_format);
+    if (AmdGpu::RemapDataFormat(requested_data_format) == AmdGpu::DataFormat::Format10_11_11 &&
+        !AmdGpu::IsSupported10_11_11NumberFormat(requested_number_format)) {
+        UNREACHABLE_MSG(
+            "Unsupported PS4 10_11_11 numeric format: shader={:#x} hw_stage={} sw_stage={} "
+            "pc={:#x} instruction_typed={} requested_data_fmt={} requested_num_fmt={} "
+            "descriptor_data_fmt={} descriptor_num_fmt={}",
+            info.pgm_hash, u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc), is_inst_typed,
+            u32(requested_data_format), u32(requested_number_format), buffer.data_format,
+            buffer.num_format);
+    }
+    if (IsBufferFormatStore(inst) &&
+        AmdGpu::RemapDataFormat(requested_data_format) == AmdGpu::DataFormat::Format10_11_11 &&
+        !AmdGpu::IsWritable10_11_11NumberFormat(requested_number_format)) {
+        UNREACHABLE_MSG(
+            "Unsupported PS4 10_11_11 store numeric format: shader={:#x} hw_stage={} "
+            "sw_stage={} pc={:#x} instruction_typed={} requested_data_fmt={} "
+            "requested_num_fmt={} descriptor_data_fmt={} descriptor_num_fmt={}",
+            info.pgm_hash, u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc), is_inst_typed,
+            u32(requested_data_format), u32(requested_number_format), buffer.data_format,
+            buffer.num_format);
+    }
+    if (requested_number_format == AmdGpu::NumberFormat::SnormNz &&
+        requested_data_format != AmdGpu::DataFormat::Format8 &&
+        requested_data_format != AmdGpu::DataFormat::Format8_8 &&
+        requested_data_format != AmdGpu::DataFormat::Format8_8_8_8 &&
+        requested_data_format != AmdGpu::DataFormat::Format16 &&
+        requested_data_format != AmdGpu::DataFormat::Format16_16 &&
+        requested_data_format != AmdGpu::DataFormat::Format16_16_16_16) {
+        LOG_WARNING(Render_Recompiler,
+                    "Formatted buffer has SNORM_NZ with unsupported guest format: shader={:#x} "
+                    "hw_stage={} sw_stage={} pc={:#x} typed={} data_fmt={} num_fmt={} "
+                    "descriptor_data_fmt={} descriptor_num_fmt={}",
+                    info.pgm_hash, u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc),
+                    is_inst_typed, u32(requested_data_format), u32(requested_number_format),
+                    buffer.data_format, buffer.num_format);
+    }
     const auto data_format =
         is_inst_typed ? AmdGpu::RemapDataFormat(flags.inst_data_fmt.Value()) : buffer.GetDataFmt();
     const auto format_info = FormatInfo{
@@ -224,6 +266,21 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
     }
 
     if (IsBufferFormatLoad(inst)) {
+        if ((data_format == AmdGpu::DataFormat::Format32 ||
+             data_format == AmdGpu::DataFormat::Format32_32 ||
+             data_format == AmdGpu::DataFormat::Format32_32_32 ||
+             data_format == AmdGpu::DataFormat::Format32_32_32_32) &&
+            format_info.num_format != AmdGpu::NumberFormat::Uint &&
+            format_info.num_format != AmdGpu::NumberFormat::Sint &&
+            format_info.num_format != AmdGpu::NumberFormat::Float) {
+            LOG_ERROR(Render_Recompiler,
+                      "LoadBufferFormat unsupported tuple: shader={:#x} hw_stage={} "
+                      "sw_stage={} pc={:#x} typed={} data_fmt={} num_fmt={} "
+                      "descriptor_data_fmt={} descriptor_num_fmt={}",
+                      info.pgm_hash, u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc),
+                      is_inst_typed, u32(data_format), u32(format_info.num_format),
+                      buffer.data_format, buffer.num_format);
+        }
         const auto interpreted =
             LoadBufferFormat(ir, inst.Arg(0), IR::U32{inst.Arg(1)}, flags, format_info);
         inst.ReplaceUsesWithAndRemove(interpreted);

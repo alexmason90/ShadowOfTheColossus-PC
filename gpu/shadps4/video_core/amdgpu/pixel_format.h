@@ -82,6 +82,39 @@ enum class NumberFormat : u32 {
     Ubscaled = 13,
 };
 
+// sotc: Sea Islands encodes DFMT and NFMT as separate buffer fields. Its legacy
+// 10:11:11 conversion uses the component widths from DFMT and the numeric
+// interpretation from NFMT; GFX10's unified-format aliases are a separate ISA
+// encoding and do not constrain these legacy pairs.
+constexpr bool IsSupported10_11_11NumberFormat(const NumberFormat format) noexcept {
+    switch (format) {
+    case NumberFormat::Unorm:
+    case NumberFormat::Snorm:
+    case NumberFormat::Uscaled:
+    case NumberFormat::Sscaled:
+    case NumberFormat::Uint:
+    case NumberFormat::Sint:
+    case NumberFormat::Float:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Sea Islands lists scaled typed-buffer formats as readable but not writable.
+constexpr bool IsWritable10_11_11NumberFormat(const NumberFormat format) noexcept {
+    switch (format) {
+    case NumberFormat::Unorm:
+    case NumberFormat::Snorm:
+    case NumberFormat::Uint:
+    case NumberFormat::Sint:
+    case NumberFormat::Float:
+        return true;
+    default:
+        return false;
+    }
+}
+
 enum class NumberClass : u8 {
     Float = 0,
     Sint = 1,
@@ -237,6 +270,7 @@ constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFo
     case NumberFormat::Uscaled:
         return NumberFormat::Uint;
     case NumberFormat::Sscaled:
+        return NumberFormat::Sint;
     case NumberFormat::SnormNz:
         return NumberFormat::Sint;
     case NumberFormat::Ubnorm:
