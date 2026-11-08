@@ -820,6 +820,66 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(eligible),
                              100.0 * double(hits) / double(std::max<u64>(eligible, 1)));
             }
+            if (SotcStats::kPreparedDraw) {
+                const uint64_t prepared_uses = SotcStats::prepared_draw_uses.exchange(0);
+                const uint64_t prepared_fastbind =
+                    SotcStats::prepared_draw_fastbind_skips.exchange(0);
+                const uint64_t prepared_fallbacks = SotcStats::prepared_draw_fallbacks.exchange(0);
+                const uint64_t prepared_mismatches =
+                    SotcStats::prepared_draw_verify_mismatches.exchange(0);
+                if (SotcStats::kPreparedDrawLazy) {
+                    const uint64_t candidates =
+                        SotcStats::prepared_draw_lazy_candidates.exchange(0);
+                    const uint64_t candidate_buffers =
+                        SotcStats::prepared_draw_lazy_candidate_buffers.exchange(0);
+                    const uint64_t consumers =
+                        SotcStats::prepared_draw_lazy_consumers.exchange(0);
+                    const uint64_t reuses =
+                        SotcStats::prepared_draw_lazy_fastbind_reuses.exchange(0);
+                    const uint64_t reused_buffers =
+                        SotcStats::prepared_draw_lazy_buffers_reused.exchange(0);
+                    const uint64_t materialized =
+                        SotcStats::prepared_draw_lazy_materializations.exchange(0);
+                    const uint64_t decoded_buffers =
+                        SotcStats::prepared_draw_lazy_buffers_decoded.exchange(0);
+                    const uint64_t lazy_fallbacks =
+                        SotcStats::prepared_draw_lazy_fallbacks.exchange(0);
+                    ReportPrintf(report,
+                                 "SOTC prepared draw lazy: candidates %llu (%llu guest buffers), "
+                                 "consumers %llu, FastBind reused %llu (%llu buffers), "
+                                 "materialized %llu (%llu buffers), fallbacks %llu, "
+                                 "layout fallbacks %llu, descriptor mismatches %llu; "
+                                 "BindBuffers uses %llu, FastBind skips %llu\n",
+                                 static_cast<unsigned long long>(candidates),
+                                 static_cast<unsigned long long>(candidate_buffers),
+                                 static_cast<unsigned long long>(consumers),
+                                 static_cast<unsigned long long>(reuses),
+                                 static_cast<unsigned long long>(reused_buffers),
+                                 static_cast<unsigned long long>(materialized),
+                                 static_cast<unsigned long long>(decoded_buffers),
+                                 static_cast<unsigned long long>(prepared_fallbacks),
+                                 static_cast<unsigned long long>(lazy_fallbacks),
+                                 static_cast<unsigned long long>(prepared_mismatches),
+                                 static_cast<unsigned long long>(prepared_uses),
+                                 static_cast<unsigned long long>(prepared_fastbind));
+                } else {
+                    const uint64_t prepared_captures =
+                        SotcStats::prepared_draw_captures.exchange(0);
+                    const uint64_t prepared_buffers = SotcStats::prepared_draw_buffers.exchange(0);
+                    const uint64_t prepared_ns = SotcStats::prepared_draw_ns.exchange(0);
+                    ReportPrintf(report,
+                                 "SOTC prepared draw eager %.0f captures/s, %.0f guest buffers/s, "
+                                 "%.2f us/capture; BindBuffers uses %llu, FastBind skips %llu, "
+                                 "fallbacks %llu, descriptor mismatches %llu\n",
+                                 prepared_captures / seconds, prepared_buffers / seconds,
+                                 prepared_captures ? double(prepared_ns) / prepared_captures / 1000.0
+                                                   : 0.0,
+                                 static_cast<unsigned long long>(prepared_uses),
+                                 static_cast<unsigned long long>(prepared_fastbind),
+                                 static_cast<unsigned long long>(prepared_fallbacks),
+                                 static_cast<unsigned long long>(prepared_mismatches));
+                }
+            }
             if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
                 const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
                 const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);

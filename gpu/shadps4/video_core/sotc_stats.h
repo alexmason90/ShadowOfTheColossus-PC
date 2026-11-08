@@ -58,6 +58,17 @@ inline const bool kFastBind = [] {
     const char* v = std::getenv("SOTC_FAST_BIND");
     return !v || v[0] != '0';
 }();
+/// SOTC_PREPARED_DRAW=1: snapshot guest buffer descriptors with queued graphics draws.
+inline const bool kPreparedDraw = [] {
+    const char* v = std::getenv("SOTC_PREPARED_DRAW");
+    return v && v[0] == '1';
+}();
+/// SOTC_PREPARED_DRAW_LAZY=1 defers descriptor decoding until FastBind misses. Eager mode remains
+/// the default whenever prepared draws are enabled.
+inline const bool kPreparedDrawLazy = [] {
+    const char* v = std::getenv("SOTC_PREPARED_DRAW_LAZY");
+    return kPreparedDraw && v && v[0] == '1';
+}();
 inline std::atomic<uint64_t> fast_bind_eligible{0};
 inline std::atomic<uint64_t> fast_bind_hits{0};
 /// sotc: bumped whenever guest memory changes outside the GPU's own draws: a write by the command
@@ -601,6 +612,17 @@ inline std::atomic<uint64_t> rt_memo_hits{0}, rt_memo_misses{0};
 /// sotc: time (ns) and draws of RefreshGraphicsKey (the part PipelineKeyMemo removes).
 inline std::atomic<uint64_t> pipe_key_ns{0}, pipe_key_draws{0};
 inline std::atomic<uint64_t> shaders_compiled{0}, shader_ns{0};
+/// SOTC_PREPARED_DRAW: CPU-side guest buffer descriptors captured with queued graphics draws,
+/// descriptors passed to BindBuffers, candidates skipped by FastBind, and fail-closed mismatches.
+inline std::atomic<uint64_t> prepared_draw_captures{0}, prepared_draw_buffers{0},
+    prepared_draw_uses{0}, prepared_draw_fastbind_skips{0}, prepared_draw_fallbacks{0},
+    prepared_draw_verify_mismatches{0}, prepared_draw_ns{0};
+/// Lazy prepared-draw candidates created by the producer and their draw-thread outcomes.
+inline std::atomic<uint64_t> prepared_draw_lazy_candidates{0},
+    prepared_draw_lazy_candidate_buffers{0}, prepared_draw_lazy_consumers{0},
+    prepared_draw_lazy_fastbind_reuses{0}, prepared_draw_lazy_buffers_reused{0},
+    prepared_draw_lazy_materializations{0}, prepared_draw_lazy_buffers_decoded{0},
+    prepared_draw_lazy_fallbacks{0};
 inline std::atomic<uint64_t> images_new{0}, image_ns{0};
 /// Parts of an image creation: format query, memory allocation (and how many got memory of
 /// their own instead of a block shared with others).

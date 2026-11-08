@@ -11,6 +11,7 @@
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -72,10 +73,11 @@ public:
     /// resolved/use_resolved: the pipeline the command processor looked up for this draw
     /// (Liverpool::IsBackThreaded), instead of looking it up here.
     void Draw(bool is_indexed, u32 index_offset = 0, const Pipeline* resolved = nullptr,
-              bool use_resolved = false);
+              bool use_resolved = false, PreparedDrawResources* prepared_draw = nullptr);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset,
-                      const Pipeline* resolved = nullptr, bool use_resolved = false);
+                      const Pipeline* resolved = nullptr, bool use_resolved = false,
+                      PreparedDrawResources* prepared_draw = nullptr);
 
     void DispatchDirect(const Pipeline* resolved = nullptr, bool use_resolved = false);
     void DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved = nullptr,
@@ -250,7 +252,8 @@ private:
     std::unique_ptr<class ShadowScroll> shadow_scroll;
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data);
+                     Shader::PushData& push_data,
+                     const PreparedDrawResources::Stage* prepared_stage = nullptr);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     static bool DrawBindMemoOn();
     struct TexBindMemo;
@@ -267,7 +270,8 @@ private:
                            boost::container::small_vector<u32, 8>& array_sizes,
                            std::array<VideoCore::ImageId, Shader::NUM_IMAGES>& bind_ids,
                            std::array<bool, Shader::NUM_IMAGES>& bind_storage, u32& num_binds);
-    bool BindResources(const Pipeline* pipeline);
+    bool BindResources(const Pipeline* pipeline,
+                       PreparedDrawResources* prepared_draw = nullptr);
     bool FastBindEligible(const Pipeline* pipeline) const;
     bool FastBindStaticEligible(const Pipeline* pipeline) const; ///< sotc: DrawReplay, see .cpp
     u64 FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const;

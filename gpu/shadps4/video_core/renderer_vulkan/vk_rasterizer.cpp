@@ -2512,7 +2512,7 @@ void Rasterizer::NoteUiShadow() {
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
-                      bool use_resolved) {
+                      bool use_resolved, PreparedDrawResources* prepared_draw) {
     RENDERER_TRACE;
     DrawPhase::Scope ph;
     if (DrawPhase::kReplay) [[unlikely]] { // sotc: SOTC_DRAW_REPLAY_PROBE
@@ -2561,7 +2561,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
     }
-    if (!BindResources(pipeline)) {
+    if (!BindResources(pipeline, prepared_draw)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
         if (SotcOps::kOn) SotcOps::NoteDrawDropped(); // sotc: SOTC_OP_STATS=1
         return;
@@ -2659,7 +2659,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset, const Pipeline* resolved,
-                              bool use_resolved) {
+                              bool use_resolved, PreparedDrawResources* prepared_draw) {
     RENDERER_TRACE;
     DrawPhase::Scope ph;
     if (DrawPhase::kReplay) [[unlikely]] { // sotc: SOTC_DRAW_REPLAY_PROBE
@@ -2718,7 +2718,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
     }
-    if (!BindResources(pipeline)) {
+    if (!BindResources(pipeline, prepared_draw)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         if (SotcOps::kOn) SotcOps::NoteDrawDropped(); // sotc: SOTC_OP_STATS=1
         return;
@@ -3359,7 +3359,8 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
 // sotc: SOTC_CS_BIND_TRACE state (BindBuffers): the current dispatch prints its bindings.
 static bool cs_bind_trace_on = false;
 
-bool Rasterizer::BindResources(const Pipeline* pipeline) {
+bool Rasterizer::BindResources(const Pipeline* pipeline,
+                               PreparedDrawResources* prepared_draw) {
     const SotcStats::SplitTimer bind_split{SotcStats::SplitBind};
     cs_bind_trace_on = false;
     if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1, touches of depth targets
@@ -3367,6 +3368,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
     fast_bind_hit = false;
     lod_marks.clear();
+    const bool lazy_candidate = prepared_draw && prepared_draw->valid &&
+                                prepared_draw->mode == PreparedDrawMode::Lazy;
+    if (lazy_candidate) {
+        SotcStats::prepared_draw_lazy_consumers.fetch_add(1, std::memory_order_relaxed);
+    }
     if (pipeline->IsCompute() && // sotc: the three tests return false at once for a graphics pipeline
         (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
          IsComputeImageClear(pipeline))) {
@@ -3420,6 +3426,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                           "user data bound",
                           stage->pgm_hash, u32(stage->sw_stage), u32(stage->hw_stage),
                           fmt::ptr(stage));
+            }
+            if (lazy_candidate) {
+                SotcStats::prepared_draw_lazy_fallbacks.fetch_add(1,
+                                                                   std::memory_order_relaxed);
             }
             fast_bind.valid = false;
             return false;
@@ -3504,6 +3514,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             static const bool verify = std::getenv("SOTC_FAST_BIND_VERIFY") != nullptr;
             if (!verify) {
                 fast_bind_hit = true;
+                if (prepared_draw) {
+                    SotcStats::prepared_draw_fastbind_skips.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+                }
+                if (lazy_candidate) {
+                    SotcStats::prepared_draw_lazy_fastbind_reuses.fetch_add(
+                        1, std::memory_order_relaxed);
+                    SotcStats::prepared_draw_lazy_buffers_reused.fetch_add(
+                        prepared_draw->guest_buffer_count, std::memory_order_relaxed);
+                }
                 if (replay_key) {
                     if (SotcStats::kFpsLog) { // see fast_bind_eligible above
                         auto& c = SotcStats::fast_bind_hits;
@@ -3530,19 +3550,51 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         fast_bind.valid = false;
         push_data = MakeUserData(liverpool->DrawRegs());
     }
+    // FastBind hits never consume the snapshot. Validate only on the binding path, directly
+    // against the pipeline stages, once before passing its stages to BindBuffers.
+    PreparedDrawResources* prepared = nullptr;
+    if (prepared_draw) {
+        prepared = SelectPreparedDraw(SotcStats::kPreparedDraw && !pipeline->IsCompute(),
+                                      prepared_draw, pipeline, pipeline->GetStages());
+        if (!prepared) {
+            SotcStats::prepared_draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            if (lazy_candidate) {
+                SotcStats::prepared_draw_lazy_fallbacks.fetch_add(1,
+                                                                   std::memory_order_relaxed);
+            }
+        }
+    }
+    if (prepared && prepared->mode == PreparedDrawMode::Lazy) {
+        const bool materialized = MaterializeLazyPreparedDraw(
+            *prepared, pipeline->GetStages(), [](const auto& stage, const auto& desc) {
+                return desc.IsSpecial() ? AmdGpu::Buffer{} : desc.GetSharp(stage);
+            });
+        if (materialized) {
+            SotcStats::prepared_draw_lazy_materializations.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+            SotcStats::prepared_draw_lazy_buffers_decoded.fetch_add(
+                prepared->guest_buffer_count, std::memory_order_relaxed);
+        } else {
+            prepared = nullptr;
+            SotcStats::prepared_draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::prepared_draw_lazy_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // Bind resource buffers and textures.
     DrawPhase::Sub(DrawPhase::SBrCheck);
     Shader::Backend::Bindings binding{};
     DrawPhase::Sub(DrawPhase::SBrUser);
+    u32 prepared_stage_index = 0;
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
         }
+        const auto* prepared_stage = prepared ? &prepared->stages[prepared_stage_index++] : nullptr;
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
         DrawPhase::Mark(DrawPhase::BindRest);
         DispPhase::Mark(DispPhase::BrPre);
-        BindBuffers(*stage, binding, push_data);
+        BindBuffers(*stage, binding, push_data, prepared_stage);
         DrawPhase::Mark(DrawPhase::BindBuf);
         DispPhase::Mark(DispPhase::BbRest);
         BindTextures(*stage, binding);
@@ -4239,9 +4291,45 @@ static bool CsBindTraceActive(u64 pgm_hash) {
 extern "C" uint64_t runtime_memory_generation(void);
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                             Shader::PushData& push_data) {
+                             Shader::PushData& push_data,
+                             const PreparedDrawResources::Stage* prepared_stage) {
     const u64 alignment = instance.StorageMinAlignment();
-    for (const auto& desc : stage.buffers) {
+    // The caller validates the complete pipeline layout; retain the count check as a local
+    // fail-closed guard before indexing a descriptor vector.
+    const bool use_prepared = prepared_stage && prepared_stage->buffers.size() ==
+                                                    prepared_stage->buffer_count &&
+                              prepared_stage->buffers.size() == stage.buffers.size();
+    static const bool verify_prepared = [] {
+        const char* value = std::getenv("SOTC_PREPARED_DRAW_VERIFY");
+        return value && value[0] == '1';
+    }();
+    bool verified_prepared = use_prepared;
+    if (verified_prepared && verify_prepared) {
+        for (size_t i = 0; i < stage.buffers.size(); ++i) {
+            const auto& desc = stage.buffers[i];
+            const AmdGpu::Buffer expected = desc.IsSpecial() ? AmdGpu::Buffer{} : desc.GetSharp(stage);
+            if (!(prepared_stage->buffers[i] == expected)) {
+                verified_prepared = false;
+                SotcStats::prepared_draw_verify_mismatches.fetch_add(1,
+                                                                     std::memory_order_relaxed);
+                static std::atomic<u32> reported{0};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 20) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Prepared draw descriptor mismatch: shader={:#x} binding={} stage={}",
+                              stage.pgm_hash, i, u32(stage.sw_stage));
+                }
+                break;
+            }
+        }
+    }
+    if (prepared_stage && !verified_prepared) {
+        SotcStats::prepared_draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (verified_prepared && !stage.buffers.empty()) {
+        SotcStats::prepared_draw_uses.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (size_t buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
+        const auto& desc = stage.buffers[buffer_index];
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
@@ -4354,7 +4442,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
-            const auto vsharp = desc.GetSharp(stage);
+            const auto vsharp = verified_prepared ? prepared_stage->buffers[buffer_index]
+                                                  : desc.GetSharp(stage);
             // Unmapped addresses show up in descriptors of bindings the shader does not use
             // (garbage left in the guest's descriptor memory); bind nothing instead of aborting.
             // Large ranges get clamped to the mapped memory at their start (0 if unmapped);

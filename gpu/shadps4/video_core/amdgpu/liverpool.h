@@ -25,6 +25,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/renderer_vulkan/vk_draw_prep.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -515,6 +516,7 @@ private:
         ComputeProgram cs{};
         std::array<BackStage, 5> stages{};
         u32 num_stages{};
+        Vulkan::PreparedDrawResources prepared_draw;
         u32 line{}; ///< sotc: SOTC_SLOW_OPS: the source line that queued a Func op (liverpool.cpp/.h)
         Common::UniqueFunction<void> func;
     };

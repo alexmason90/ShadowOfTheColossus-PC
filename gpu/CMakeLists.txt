@@ -364,3 +364,8 @@ add_executable(image-msaa-array-test EXCLUDE_FROM_ALL ../tests/test_image_msaa_a
 target_include_directories(image-msaa-array-test PRIVATE shim shadps4 third_party/gcn/include)
 target_compile_options(image-msaa-array-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(image-msaa-array-test PRIVATE bbgpu)
+
+add_executable(prepared-draw-test EXCLUDE_FROM_ALL ../tests/test_prepared_draw.cpp)
+target_compile_options(prepared-draw-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(prepared-draw-test PRIVATE shim shadps4)
+target_link_libraries(prepared-draw-test PRIVATE fmt::fmt)

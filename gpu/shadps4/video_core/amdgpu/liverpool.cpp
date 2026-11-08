@@ -383,6 +383,12 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
     BackOp& op = back_ring[head & back_ring_mask];
     op.pipeline = nullptr;
     op.num_stages = 0;
+    op.prepared_draw.pipeline = nullptr;
+    op.prepared_draw.num_stages = 0;
+    op.prepared_draw.guest_buffer_count = 0;
+    op.prepared_draw.mode = Vulkan::PreparedDrawMode::None;
+    op.prepared_draw.materialized = false;
+    op.prepared_draw.valid = false;
     // The registers as of this point of the command stream: the chunks changed since the last op.
     // sotc: BbToggle::DrawFixedCostOpt. Per chunk: its index, a 64-bit mask of the dwords that
     // differ from what the draw thread already holds (back_shadow, kept equal to its back_regs:
@@ -525,6 +531,67 @@ void Liverpool::CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline) {
             changed = true;
         }
         stage.changed = changed;
+    }
+
+    // Prepared descriptors are CPU-only. Eager mode decodes them on the producer. Lazy mode
+    // records only the layout here; the BackOp-owned flat user data remains live until its draw is
+    // consumed, and the draw thread materializes descriptors only after FastBind misses.
+    if (!SotcStats::kPreparedDraw || pipeline->IsCompute()) {
+        return;
+    }
+    const bool lazy = SotcStats::kPreparedDrawLazy;
+    const auto prep_start = lazy ? std::chrono::steady_clock::time_point{}
+                                 : std::chrono::steady_clock::now();
+    auto& prepared = op.prepared_draw;
+    prepared.pipeline = pipeline;
+    prepared.num_stages = 0;
+    prepared.guest_buffer_count = 0;
+    prepared.mode = lazy ? Vulkan::PreparedDrawMode::Lazy : Vulkan::PreparedDrawMode::Eager;
+    prepared.materialized = !lazy;
+    u64 guest_buffers = 0;
+    for (u32 i = 0; i < op.num_stages; ++i) {
+        const auto* info = op.stages[i].info;
+        auto& dst = prepared.stages[i];
+        dst.info = info;
+        dst.buffer_count = info->buffers.size();
+        dst.buffers.clear();
+        if (!lazy && dst.buffers.capacity() < info->buffers.size()) {
+            dst.buffers.reserve(info->buffers.size());
+        }
+        for (const auto& desc : info->buffers) {
+            if (!desc.IsSpecial()) {
+                ++guest_buffers;
+                if (!lazy) {
+                    dst.buffers.emplace_back(desc.GetSharp(*info));
+                }
+            } else if (!lazy) {
+                dst.buffers.emplace_back(AmdGpu::Buffer{});
+            }
+        }
+        ++prepared.num_stages;
+    }
+    if (guest_buffers != 0) {
+        prepared.guest_buffer_count = static_cast<u32>(guest_buffers);
+        prepared.valid = true;
+        if (lazy) {
+            SotcStats::prepared_draw_lazy_candidates.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::prepared_draw_lazy_candidate_buffers.fetch_add(guest_buffers,
+                                                                      std::memory_order_relaxed);
+        } else {
+            SotcStats::prepared_draw_captures.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::prepared_draw_buffers.fetch_add(guest_buffers, std::memory_order_relaxed);
+            SotcStats::prepared_draw_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - prep_start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
+    } else {
+        prepared.pipeline = nullptr;
+        prepared.num_stages = 0;
+        prepared.guest_buffer_count = 0;
+        prepared.mode = Vulkan::PreparedDrawMode::None;
+        prepared.materialized = false;
     }
 }
 
@@ -684,12 +751,14 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         op.func();
         break;
     case BackOp::Kind::Draw:
-        rasterizer->Draw(op.is_indexed, op.index_offset, op.pipeline, true);
+        rasterizer->Draw(op.is_indexed, op.index_offset, op.pipeline, true,
+                         op.prepared_draw.valid ? &op.prepared_draw : nullptr);
         break;
     case BackOp::Kind::DrawIndirect:
         rasterizer->DrawIndirect(op.is_indexed, op.address, op.offset, op.stride, op.max_count,
                                  op.count_address, op.vertex_sgpr_offset, op.instance_sgpr_offset,
-                                 op.pipeline, true);
+                                 op.pipeline, true,
+                                 op.prepared_draw.valid ? &op.prepared_draw : nullptr);
         break;
     case BackOp::Kind::Dispatch:
         back_cs = op.cs;
