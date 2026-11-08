@@ -292,6 +292,10 @@ if (WIN32)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
 else()
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
+    # sotc: bb-probe links libbbgpu.so directly (never dlopen), so its thread_locals can live in
+    # the static TLS block: one %fs-relative access instead of a __tls_get_addr call (~2% of the
+    # draw thread at the Shrine, plus the texture cache lock's owner token on every hold).
+    target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
 endif()
 
 # bbport (Windows): bbgpu is a static library there, so the loader and the HLE runtime are
