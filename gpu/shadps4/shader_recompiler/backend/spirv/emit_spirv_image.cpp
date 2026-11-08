@@ -303,8 +303,15 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = LoadImage(ctx, inst, texture);
     const Id zero = ctx.u32_zero_value;
-    const auto mips{[&] { return has_mips ? ctx.OpImageQueryLevels(ctx.U32[1], image) : zero; }};
-    const bool uses_lod{texture.view_type != AmdGpu::ImageType::Color2DMsaa && !texture.is_storage};
+    const bool is_multisampled = texture.view_type == AmdGpu::ImageType::Color2DMsaa ||
+                                 texture.view_type == AmdGpu::ImageType::Color2DMsaaArray;
+    const auto mips{[&] {
+        if (!has_mips) {
+            return zero;
+        }
+        return is_multisampled ? ctx.ConstU32(1U) : ctx.OpImageQueryLevels(ctx.U32[1], image);
+    }};
+    const bool uses_lod{!is_multisampled && !texture.is_storage};
     const auto query{[&](Id type) {
         return uses_lod ? ctx.OpImageQuerySizeLod(type, image, lod)
                         : ctx.OpImageQuerySize(type, image);
@@ -324,6 +331,7 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
     case AmdGpu::ImageType::Color2DMsaa:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[2]), zero, mips());
     case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Color2DMsaaArray:
     case AmdGpu::ImageType::Cube:
     case AmdGpu::ImageType::Color3D:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
@@ -357,21 +365,30 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
 }
 
+static bool IsMultisampled(AmdGpu::ImageType view_type) {
+    return view_type == AmdGpu::ImageType::Color2DMsaa ||
+           view_type == AmdGpu::ImageType::Color2DMsaaArray;
+}
+
+static Id WrapMultisampleIndex(EmitContext& ctx, Id image, Id ms) {
+    ASSERT_MSG(Sirit::ValidId(ms), "Multisampled image operation is missing its sample index");
+    const Id sample_count = ctx.OpImageQuerySamples(ctx.U32[1], image);
+    return ctx.OpUMod(ctx.U32[1], ms, sample_count);
+}
+
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms) {
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id color_type = texture.data_types->Get(4);
     const Id fixed_coords = FixImageCoords<false>(ctx, coords, texture.view_type);
+    const bool is_multisampled = IsMultisampled(texture.view_type);
     ImageOperands operands;
     Id texel;
     if (!texture.is_storage) {
         const Id image = LoadImage(ctx, inst, texture);
-        if (texture.view_type == AmdGpu::ImageType::Color2DMsaa) {
+        if (is_multisampled) {
             // GCN hardware wraps out-of-range MSAA sample indices
-            if (Sirit::ValidId(ms)) {
-                const Id sample_count = ctx.OpImageQuerySamples(ctx.U32[1], image);
-                const Id wrapped_ms = ctx.OpUMod(ctx.U32[1], ms, sample_count);
-                operands.Add(spv::ImageOperandsMask::Sample, wrapped_ms);
-            }
+            operands.Add(spv::ImageOperandsMask::Sample,
+                         WrapMultisampleIndex(ctx, image, ms));
         } else {
             if (Sirit::ValidId(ms)) {
                 LOG_ERROR(Render_Recompiler, "image is not MS but ms operand is provided");
@@ -399,6 +416,11 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
 #endif
         }
         const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+        if (is_multisampled) {
+            // OpImageRead requires Sample whenever the image type has MS=1.
+            operands.Add(spv::ImageOperandsMask::Sample,
+                         WrapMultisampleIndex(ctx, image, ms));
+        }
         texel = ctx.OpImageRead(color_type, image, fixed_coords, operands.mask, operands.operands);
     }
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texel) : texel;
@@ -411,7 +433,7 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     const Id color_type = texture.data_types->Get(4);
     const Id fixed_coords = FixImageCoords<false>(ctx, coords, texture.view_type);
     ImageOperands operands;
-    operands.Add(spv::ImageOperandsMask::Sample, ms);
+    const bool is_multisampled = IsMultisampled(texture.view_type);
     if (ctx.profile.supports_image_load_store_lod) {
         operands.Add(spv::ImageOperandsMask::Lod, lod);
     } else if (Sirit::ValidId(lod)) {
@@ -422,6 +444,13 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
         image_ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
     }
     const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+    if (is_multisampled) {
+        // OpImageWrite requires Sample for multisampled images. GCN sample indices wrap.
+        operands.Add(spv::ImageOperandsMask::Sample,
+                     WrapMultisampleIndex(ctx, image, ms));
+    } else {
+        operands.Add(spv::ImageOperandsMask::Sample, ms);
+    }
     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
     ctx.OpImageWrite(image, fixed_coords, texel, operands.mask, operands.operands);
 }

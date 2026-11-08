@@ -359,3 +359,8 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+add_executable(image-msaa-array-test EXCLUDE_FROM_ALL ../tests/test_image_msaa_array.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(image-msaa-array-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(image-msaa-array-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(image-msaa-array-test PRIVATE bbgpu)

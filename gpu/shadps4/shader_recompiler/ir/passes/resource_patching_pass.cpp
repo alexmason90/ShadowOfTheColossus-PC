@@ -19,6 +19,24 @@
 namespace Shader::Optimization {
 namespace {
 
+[[noreturn]] void UnsupportedImageViewType(const char* operation, const Info& info,
+                                           const IR::Inst& inst, AmdGpu::ImageType view_type) {
+    const IR::Block& block = *inst.GetParent();
+    u32 instruction_index = 0;
+    for (const IR::Inst& candidate : block.Instructions()) {
+        if (&candidate == &inst) {
+            break;
+        }
+        ++instruction_index;
+    }
+    UNREACHABLE_MSG(
+        "{}: unsupported image view type {} ({}) in shader {:#x}, hw_stage {}, IR block {}, "
+        "instruction {} ({}), guest pc {:#x}",
+        operation, AmdGpu::NameOf(view_type), static_cast<u32>(view_type), info.pgm_hash,
+        static_cast<u32>(info.hw_stage), block.po_index, instruction_index, inst.GetOpcode(),
+        inst.Flags<IR::TextureInstInfo>().pc.Value());
+}
+
 IR::Type BufferDataType(const IR::Inst& inst, const Profile& profile) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::LoadBufferU8:
@@ -487,7 +505,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
             case AmdGpu::ImageType::Color2DMsaa:
             case AmdGpu::ImageType::Color2DMsaaArray:
             default:
-                UNREACHABLE_MSG("Invalid image type {}", view_type);
+                UnsupportedImageViewType("image mip/storage fallback", info, inst, view_type);
             }
         }();
 
@@ -893,7 +911,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         if (index == 12) {
             return body4;
         }
-        UNREACHABLE();
+        UnsupportedImageViewType("sample address-register lookup", info, inst, view_type);
     };
     u32 addr_reg = 0;
 
@@ -928,12 +946,13 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Color2DMsaaArray:
         case AmdGpu::ImageType::Cube:
             return ir.CompositeConstruct(read(0), read(8));
         case AmdGpu::ImageType::Color3D:
             return ir.CompositeConstruct(read(0), read(8), read(16));
         default:
-            UNREACHABLE();
+            UnsupportedImageViewType("sample offset construction", info, inst, view_type);
         }
     }();
     const IR::F32 bias = inst_info.has_bias ? get_addr_reg(addr_reg++) : IR::F32{};
@@ -951,6 +970,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Color2DMsaaArray:
         case AmdGpu::ImageType::Cube:
             // (du/dx, dv/dx), (du/dy, dv/dy)
             addr_reg = addr_reg + 4;
@@ -964,7 +984,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
                     ir.CompositeConstruct(get_addr_reg(addr_reg - 3), get_addr_reg(addr_reg - 2),
                                           get_addr_reg(addr_reg - 1))};
         default:
-            UNREACHABLE();
+            UnsupportedImageViewType("sample derivative construction", info, inst, view_type);
         }
     }();
 
@@ -1008,13 +1028,19 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             addr_reg = addr_reg + 2;
             return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
         case AmdGpu::ImageType::Color2DArray: // x, y, slice
-        case AmdGpu::ImageType::Cube:         // x, y, face
-        case AmdGpu::ImageType::Color3D:      // x, y, z
+        case AmdGpu::ImageType::Cube: // x, y, face
+        case AmdGpu::ImageType::Color3D: // x, y, z
             addr_reg = addr_reg + 3;
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
                                          get_coord(addr_reg - 1, 2));
+        case AmdGpu::ImageType::Color2DMsaaArray: { // x, y, integer array layer
+            addr_reg = addr_reg + 3;
+            const auto layer = ir.ConvertFToU(32, get_addr_reg(addr_reg - 1));
+            return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
+                                         layer);
+        }
         default:
-            UNREACHABLE();
+            UnsupportedImageViewType("sample coordinate construction", info, inst, view_type);
         }
     }();
 
@@ -1101,7 +1127,10 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
                     skip_lod = true;
                 } else {
                     UNREACHABLE_MSG(
-                        "Encountered a _mip instruction with MSAA image, and mipid is non-zero");
+                        "Encountered a _mip instruction with MSAA image, and mipid is non-zero "
+                        "(view {}, shader {:#x}, guest pc {:#x}, IR block {}, opcode {})",
+                        AmdGpu::NameOf(view_type), info.pgm_hash, inst_info.pc.Value(),
+                        inst.GetParent()->po_index, inst.GetOpcode());
                 }
             }
             return {ir.CompositeConstruct(body->Arg(0), body->Arg(1)), body->Arg(skip_lod ? 3 : 2)};
@@ -1113,7 +1142,7 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
         case AmdGpu::ImageType::Color3D:          // x, y, z, [lod]
             return {ir.CompositeConstruct(body->Arg(0), body->Arg(1), body->Arg(2)), body->Arg(3)};
         default:
-            UNREACHABLE_MSG("Unknown image type {}", view_type);
+            UnsupportedImageViewType("image coordinate construction", info, inst, view_type);
         }
     }();
 

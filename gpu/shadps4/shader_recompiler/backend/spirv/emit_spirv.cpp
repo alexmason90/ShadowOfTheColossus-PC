@@ -389,6 +389,29 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
             ctx.AddCapability(spv::Capability::ImageReadWriteLodAMD);
         }
     }
+    const bool has_multisampled_storage_image = std::ranges::any_of(
+        info.images, [&](const ImageResource& desc) {
+            if (!desc.is_written) {
+                return false;
+            }
+            const auto view_type = desc.GetSharp(info).GetViewType(desc.is_array);
+            return view_type == AmdGpu::ImageType::Color2DMsaa ||
+                   view_type == AmdGpu::ImageType::Color2DMsaaArray;
+        });
+    if (has_multisampled_storage_image) {
+        ctx.AddCapability(spv::Capability::StorageImageMultisample);
+    }
+    const bool has_multisampled_storage_array = std::ranges::any_of(
+        info.images, [&](const ImageResource& desc) {
+            if (!desc.is_written) {
+                return false;
+            }
+            return desc.GetSharp(info).GetViewType(desc.is_array) ==
+                   AmdGpu::ImageType::Color2DMsaaArray;
+        });
+    if (has_multisampled_storage_array) {
+        ctx.AddCapability(spv::Capability::ImageMSArray);
+    }
     if (info.has_image_gather) {
         ctx.AddCapability(spv::Capability::ImageGatherExtended);
     }
