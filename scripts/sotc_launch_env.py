@@ -29,3 +29,17 @@ def native_runtime_defaults(env):
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
     # in 120 Hz vblanks).
     env.setdefault('BB_VBLANK_HZ', '120')
+    if os.name == 'nt':
+        return  # the Windows launcher (game_environment) sets the ones below itself
+    # Linux parity with the Windows launcher, which sets these for every player; they are not
+    # performance switches, so SOTC_LINUX_PERF=0 keeps them.
+    # 0.72.2 (T51): at the end of the game the game returns page pool pages under textures it
+    # goes on drawing; a refresh then uploaded another texture's bytes into them (stretched
+    # textures, flicker, the close between the ending and the intro).
+    env.setdefault('SOTC_POOL_FREEZE', '1')
+    # High quality textures (the Windows launcher's default "High"): the texture banks sampled
+    # since the last report read as sampled, so the game streams its fine mips (blurry leaves and
+    # rocks without), with the 1-tick linger. SOTC_LOD_FEEDBACK=0 / SOTC_LOD_LINGER=0 restore
+    # the old behaviour for cards short of video memory.
+    env.setdefault('SOTC_LOD_LINGER', '1')
+    env.setdefault('SOTC_LOD_FEEDBACK', '1')

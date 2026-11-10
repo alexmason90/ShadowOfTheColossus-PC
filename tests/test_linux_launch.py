@@ -38,6 +38,19 @@ class LinuxLaunchTests(unittest.TestCase):
         sotc.linux_performance_defaults(disabled)
         self.assertEqual(disabled,{'SOTC_LINUX_PERF':'0'})
 
+    def test_runtime_defaults_match_windows_launcher(self):
+        # The pool freeze (end-game textures) and the texture streaming feedback are set by the
+        # Windows launcher for every player; the performance opt-out must not drop them.
+        env = {'SOTC_LINUX_PERF': '0'}
+        sotc.native_runtime_defaults(env)
+        for key in ('SOTC_POOL_FREEZE', 'SOTC_LOD_LINGER', 'SOTC_LOD_FEEDBACK'):
+            self.assertEqual(env[key], '1', key)
+        self.assertNotIn('SOTC_RB_HOT', env)
+        overridden = {'SOTC_LOD_FEEDBACK': '0', 'SOTC_POOL_FREEZE': '0'}
+        sotc.native_runtime_defaults(overridden)
+        self.assertEqual(overridden['SOTC_LOD_FEEDBACK'], '0')
+        self.assertEqual(overridden['SOTC_POOL_FREEZE'], '0')
+
     def test_script_fingerprint_survives_appimage_remounts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
