@@ -13,6 +13,7 @@
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <source_location>
 #include <string>
 #include <thread>
@@ -408,6 +409,8 @@ private:
     }
     /// Writes an EOP/EOS fence value, keeping GPU caches of that memory coherent.
     void WriteFenceValue(void* address, u64 data, u32 num_bytes);
+    /// sotc: moves a compute queue read pointer (guest memory) by `dwords` (liverpool.cpp).
+    void AdvanceReadPointer(u32* read_addr, u32 dwords, u32 ring_size_dw);
     void Process(std::stop_token stoken);
 
     struct GpuQueue {

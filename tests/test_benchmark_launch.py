@@ -21,10 +21,14 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             env = bench.build_probe_environment(base, Path('out'), Path('/isolated/reference-b01'))
             launched = dict(base)
             sotc_launch_env.native_runtime_defaults(launched)
-        for key in ('BB_DMEM_MB', 'BB_VBLANK_HZ', 'SOTC_RB_HOT', 'SOTC_GUARD_STALE',
-                    'SOTC_GUARD_USER_POINTER', 'SOTC_RELEASE_DEFER', 'SOTC_IMAGE_DEDICATED',
-                    'BB_PRESENT_MODE'):
+        for key in ('BB_DMEM_MB', 'BB_VBLANK_HZ', 'SOTC_RB_HOT', 'SOTC_RELEASE_DEFER',
+                    'SOTC_IMAGE_DEDICATED', 'BB_PRESENT_MODE', 'SOTC_POOL_FREEZE',
+                    'SOTC_LOD_LINGER', 'SOTC_LOD_FEEDBACK', 'SOTC_LOD_LEVEL'):
             self.assertEqual(env[key], launched[key], key)
+        # 0.73: the heap guard shortcuts spoilt the game's heap at the ending; off by default.
+        for key in ('SOTC_GUARD_STALE', 'SOTC_GUARD_USER_POINTER'):
+            self.assertNotIn(key, env)
+            self.assertNotIn(key, launched)
         self.assertEqual(env['BB_DMEM_MB'], '9152')
         self.assertEqual(base, {'PATH': '/usr/bin'})
         self.assertEqual(env['SOTC_PREPARED_DRAW'], '0')

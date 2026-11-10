@@ -446,6 +446,20 @@ int main(int argc, char** argv) {
     CHECK(!AmdGpu::IsWritable10_11_11NumberFormat(NumberFormat::Uscaled));
     CHECK(!AmdGpu::IsWritable10_11_11NumberFormat(NumberFormat::Sscaled));
     CHECK(!AmdGpu::IsSupported10_11_11NumberFormat(NumberFormat::SnormNz));
+    // A sharp with an impossible number format (one the game has not written yet) is lowered as a
+    // null sharp instead of ending the game: every unsupported read, and scaled writes too.
+    using AmdGpu::DataFormat;
+    CHECK(AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, NumberFormat::SnormNz, false));
+    CHECK(AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, NumberFormat::SnormNz, true));
+    CHECK(!AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, NumberFormat::Uscaled, false));
+    CHECK(AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, NumberFormat::Uscaled, true));
+    for (const auto format : {NumberFormat::Float, NumberFormat::Unorm, NumberFormat::Snorm,
+                              NumberFormat::Uint, NumberFormat::Sint}) {
+        CHECK(!AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, format, false));
+        CHECK(!AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, format, true));
+    }
+    // Other data formats are not this check's business.
+    CHECK(!AmdGpu::IsUnconvertible10_11_11(DataFormat::Format8_8_8_8, NumberFormat::SnormNz, false));
     CHECK(AmdGpu::RemapNumberFormat(NumberFormat::Uscaled, AmdGpu::DataFormat::Format10_11_11) ==
           NumberFormat::Uint);
     CHECK(AmdGpu::RemapNumberFormat(NumberFormat::Sscaled, AmdGpu::DataFormat::Format10_11_11) ==

@@ -10,8 +10,9 @@ def linux_performance_defaults(env):
     if os.name == 'nt' or env.get('SOTC_LINUX_PERF', '1') != '1':
         return
     for key, value in {
-        'SOTC_RB_HOT': '1', 'SOTC_GUARD_STALE': '1',
-        'SOTC_GUARD_USER_POINTER': '1', 'SOTC_RELEASE_DEFER': '1',
+        # The heap guard's two shortcuts (SOTC_GUARD_STALE, SOTC_GUARD_USER_POINTER) stay off,
+        # as in the Windows launcher since 0.73: they spoilt the game's heap at the ending.
+        'SOTC_RB_HOT': '1', 'SOTC_RELEASE_DEFER': '1',
         'SOTC_IMAGE_DEDICATED': '1', 'BB_PRESENT_MODE': 'Mailbox',
     }.items():
         env.setdefault(key, value)
@@ -43,3 +44,5 @@ def native_runtime_defaults(env):
     # the old behaviour for cards short of video memory.
     env.setdefault('SOTC_LOD_LINGER', '1')
     env.setdefault('SOTC_LOD_FEEDBACK', '1')
+    # 0.73: High's finer mip (the Windows launcher's level for "High" without the light profile).
+    env.setdefault('SOTC_LOD_LEVEL', '1')

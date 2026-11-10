@@ -190,11 +190,11 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
-    u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier
     /// sotc: a GPU copy wrote this image (Runtime::CopyImage and friends) without marking it
     /// GpuModified (the source was not): its bytes are not just guest memory, so the cold sweep
     /// (BbToggle::ColdImageSweep) leaves it alone.
     bool sotc_gpu_copied{};
+    u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier
     /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
     u64 sotc_shadow_saving{};
     /// sotc: F9: the next upload reads guest memory itself, not the buffer cache's GPU copy.

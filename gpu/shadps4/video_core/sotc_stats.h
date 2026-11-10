@@ -20,7 +20,6 @@
 namespace SotcStats {
 inline std::atomic<uint64_t> push_clobbers{0};
 inline thread_local uint64_t thread_data_events = 0;
-inline std::atomic<uint64_t> read_fault_stale_gpu{0};
 /// sotc: the switches of the stats printers in videoout/driver.cpp (SOTC_FPS line; SOTC_CMD_STATS
 /// lines inside it), read once at static initialisation, before any guest thread runs (no
 /// function-local static guard and no getenv inside the vectored fault handler; same pattern as
@@ -128,18 +127,21 @@ inline const bool kRbAge = [] {
     return v && v[0] == '1';
 }();
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
+/// ... the ahead path was idle only because sparse binds were pending (data itself submitted)
+inline std::atomic<uint64_t> readback_finish_binds{0};
+/// ... only the widened window of the asked bytes was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_window{0};
+/// ... only a hot region brought along was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_hot{0};
+/// async readbacks whose window was re-written in flight and re-read synchronously
+inline std::atomic<uint64_t> readback_dirty_retries{0};
+/// stale hot bring-alongs dropped instead of forcing that synchronous re-read (SOTC_RB_PART)
+inline std::atomic<uint64_t> rb_dirty_hot_dropped{0};
+/// Dirtied readback windows re-read asynchronously (another round trip) instead of synchronously.
+inline std::atomic<uint64_t> rb_requeues{0};
 // sotc: metadata-clipped non-stack readback ranges and bytes, per SOTC_FPS report.
 inline std::atomic<uint64_t> heap_guard_clipped_writes{0}, heap_guard_clipped_bytes{0};
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
-inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
-inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame
-inline std::atomic<uint64_t> upload_deferred_bytes{0};
-inline std::atomic<uint64_t> upload_zero_filled{0};     ///< ... images filled with zeros meanwhile
-inline std::atomic<uint64_t> heap_guard_ns{0};        ///< time of the guard builds (free-tree walks)
-inline std::atomic<uint64_t> heap_guard_worst_ns{0};
-inline std::atomic<uint64_t> heap_guard_worst_blocks{0}; ///< free blocks of the slowest build
-inline std::atomic<uint64_t> heap_guard_worst_adds{0};   ///< ... and the visits it made
-inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< nodes and ring members seen again, skipped
 // sotc: BPE guard cost split per SOTC_FPS report (only counted with SOTC_FPS): batches, heaps whose
 // extents were checked, tree nodes walked by builds, heaps whose extent list could not be proven (always
 // built), and ns spent selecting heaps / building guards / filtering the writes.
@@ -181,6 +183,22 @@ inline std::atomic<uint64_t> rbs_fine_finishes{0}, rbs_fine_applied_bytes{0}, rb
 inline std::atomic<uint64_t> rbv_applied{0}, rbv_applied_bad{0}, rbv_skipped{0}, rbv_skipped_bad{0},
     rbv_gpuwrite{0}, rbv_gpuwrite_changed{0}, rbv_set_bad{0}, rbv_page_bad{0}, rbv_calls{0},
     rbv_skipped_in_set{0}, rbv_skipped_backing{0}, rbv_skipped_cpu{0};
+inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
+inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame
+inline std::atomic<uint64_t> upload_deferred_bytes{0};
+inline std::atomic<uint64_t> upload_zero_filled{0};     ///< ... images filled with zeros meanwhile
+inline std::atomic<uint64_t> heap_guard_ns{0};        ///< time of the guard builds (free-tree walks)
+inline std::atomic<uint64_t> heap_guard_worst_ns{0};
+inline std::atomic<uint64_t> heap_guard_worst_blocks{0}; ///< free blocks of the slowest build
+inline std::atomic<uint64_t> heap_guard_worst_adds{0};   ///< ... and the visits it made
+inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< nodes and ring members seen again, skipped
+/// sotc: guard diagnostics: builds by path [0 world-heap refresh, 1 batch guard], Covers misses by why
+/// [0..3], FindUsedBlock results after a build [0 found, 1..6 why]
+inline std::atomic<uint64_t> hg_build_path[2]{}, hg_cover_why[4]{}, hg_find_why[7]{};
+/// sotc: heap pieces [0 batches with a valid piece list, 1 without, 2 writes outside every piece,
+/// 3 fence-tail writes that landed in a piece, 4 writes vouched by a piece chain]
+inline std::atomic<uint64_t> hg_piece[5]{};      ///< nodes and ring members seen again, skipped
+inline std::atomic<uint64_t> copy_guest_fallbacks{0}; ///< SOTC_COPY_GUEST_VIEW copies that faulted (backing view)
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
 inline std::atomic<uint64_t> readback_bytes{0};
@@ -242,6 +260,49 @@ inline uint64_t NowNs() {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 } ///< draws and dispatches recorded
+/// sotc: throttle for warnings on hot paths (per draw or dispatch, vk_rasterizer.cpp). A line is
+/// printed only if its site (the tag pointer, hashed to a slot) waited min_interval_ns and the
+/// global budget of kLogLinesPerSecond has room in the current one-second window; otherwise the
+/// caller drops it. Every printed line counts in log_lines, every dropped one in log_suppressed
+/// (the SOTC_FPS window prints both; videoout/driver.cpp).
+inline constexpr uint32_t kLogLinesPerSecond = 5;
+inline constexpr uint32_t kLogSlots = 8;
+inline std::atomic<uint64_t> log_lines{0};      ///< lines printed through LogThrottled
+inline std::atomic<uint64_t> log_suppressed{0}; ///< lines LogThrottled dropped
+inline bool LogThrottled(const char* tag, int64_t min_interval_ns = 200'000'000) {
+    // One slot per tag (collisions only make both sites print less). Read-only on the hot path
+    // until a line is actually due, so a suppressed line costs two relaxed loads and one add.
+    static std::atomic<int64_t> slot_ns[kLogSlots]{};
+    static std::atomic<int64_t> window_start{-1'000'000'000};
+    static std::atomic<uint32_t> window_lines{0};
+    const int64_t now = static_cast<int64_t>(NowNs());
+    std::atomic<int64_t>& slot =
+        slot_ns[((reinterpret_cast<std::uintptr_t>(tag) >> 4) ^
+                 (reinterpret_cast<std::uintptr_t>(tag) >> 9)) &
+                (kLogSlots - 1)];
+    const int64_t last = slot.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < min_interval_ns) {
+        log_suppressed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    int64_t start = window_start.load(std::memory_order_relaxed);
+    if (now - start >= 1'000'000'000) {
+        int64_t expected = start;
+        if (window_start.compare_exchange_strong(expected, now, std::memory_order_relaxed)) {
+            window_lines.store(0, std::memory_order_relaxed);
+        }
+    }
+    if (window_lines.load(std::memory_order_relaxed) >= kLogLinesPerSecond) {
+        log_suppressed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    // The budget check is racy (a few lines may slip over per window), which is fine for a
+    // diagnostic throttle and keeps a single atomic add here.
+    window_lines.fetch_add(1, std::memory_order_relaxed);
+    slot.store(now, std::memory_order_relaxed);
+    log_lines.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
 
 /// sotc: SOTC_BUFFER_PROFILE=1 enables BufferCache::ObtainBuffer stage timing, exact-range
 /// recurrence sampling, and backing/mapping invalidation counters. Diagnostic-only; the disabled
@@ -511,6 +572,8 @@ void RegisterSplitThread(SplitThread which);
 uint64_t SplitThreadCycles(SplitThread which);
 /// Page faults of the whole process so far (GetProcessMemoryInfo), 0 where unknown.
 uint64_t SplitProcessFaults();
+/// Commit charge and free RAM, to stderr (session log); sotc_stats.cpp.
+void LogSystemMemory();
 /// A texture copy of `bytes` from guest memory: its wall time goes to SplitTexCopy and the counts
 /// to SplitTexBytes..SplitTexFaults (draw thread only, SOTC_DRAW_SPLIT).
 struct SplitTexCopyScope {
@@ -535,49 +598,6 @@ struct SplitTexCopyScope {
         }
     }
 };
-/// sotc: throttle for warnings on hot paths (per draw or dispatch, vk_rasterizer.cpp). A line is
-/// printed only if its site (the tag pointer, hashed to a slot) waited min_interval_ns and the
-/// global budget of kLogLinesPerSecond has room in the current one-second window; otherwise the
-/// caller drops it. Every printed line counts in log_lines, every dropped one in log_suppressed
-/// (the SOTC_FPS window prints both; videoout/driver.cpp).
-inline constexpr uint32_t kLogLinesPerSecond = 5;
-inline constexpr uint32_t kLogSlots = 8;
-inline std::atomic<uint64_t> log_lines{0};      ///< lines printed through LogThrottled
-inline std::atomic<uint64_t> log_suppressed{0}; ///< lines LogThrottled dropped
-inline bool LogThrottled(const char* tag, int64_t min_interval_ns = 200'000'000) {
-    // One slot per tag (collisions only make both sites print less). Read-only on the hot path
-    // until a line is actually due, so a suppressed line costs two relaxed loads and one add.
-    static std::atomic<int64_t> slot_ns[kLogSlots]{};
-    static std::atomic<int64_t> window_start{-1'000'000'000};
-    static std::atomic<uint32_t> window_lines{0};
-    const int64_t now = static_cast<int64_t>(NowNs());
-    std::atomic<int64_t>& slot =
-        slot_ns[((reinterpret_cast<std::uintptr_t>(tag) >> 4) ^
-                 (reinterpret_cast<std::uintptr_t>(tag) >> 9)) &
-                (kLogSlots - 1)];
-    const int64_t last = slot.load(std::memory_order_relaxed);
-    if (last != 0 && now - last < min_interval_ns) {
-        log_suppressed.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    int64_t start = window_start.load(std::memory_order_relaxed);
-    if (now - start >= 1'000'000'000) {
-        int64_t expected = start;
-        if (window_start.compare_exchange_strong(expected, now, std::memory_order_relaxed)) {
-            window_lines.store(0, std::memory_order_relaxed);
-        }
-    }
-    if (window_lines.load(std::memory_order_relaxed) >= kLogLinesPerSecond) {
-        log_suppressed.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    // The budget check is racy (a few lines may slip over per window), which is fine for a
-    // diagnostic throttle and keeps a single atomic add here.
-    window_lines.fetch_add(1, std::memory_order_relaxed);
-    slot.store(now, std::memory_order_relaxed);
-    log_lines.fetch_add(1, std::memory_order_relaxed);
-    return true;
-}
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
@@ -634,6 +654,8 @@ inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicat
 inline std::atomic<uint64_t> release_queued{0}, release_done{0}, release_forced{0},
     release_pending_blocks{0};
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+/// sotc: host (not device-local) heaps: usage reported by the driver, and VMA's blocks in them.
+inline std::atomic<uint64_t> host_heap_usage{0}, host_vma_block_bytes{0};
 /// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
 /// written back to memory first, and the images in the cache with their (guest) size.
 inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};
@@ -641,6 +663,8 @@ inline std::atomic<uint64_t> cached_images{0}, cached_image_bytes{0};
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
 inline std::atomic<uint64_t> write_fault_gpu_pending{0}; ///< write-fault readbacks left protected
 inline std::atomic<uint64_t> write_fault_stale_gpu{0};   ///< ... that cleared a stale GPU page bit
+inline std::atomic<uint64_t> read_fault_stale_gpu{0};    ///< sotc: the same for a read fault
+inline std::atomic<uint64_t> read_fault_out_of_step{0};  ///< sotc: host protection without a watcher
 inline std::atomic<uint64_t> arena_evicted{0};  ///< arena bytes given back by MaybeEvictCold
 inline std::atomic<uint64_t> arena_rebound{0};  ///< ... bound again afterwards
 inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shaders (kept since)
@@ -771,6 +795,10 @@ inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
 /// on one hard disk made the loading screen last 2 minutes).
 inline std::atomic<bool> warmup_finished{false};
 inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
+/// sotc: how long flips waited between the submit and the present thread taking them (input delay).
+inline std::atomic<uint64_t> flip_age_ns{0};
+inline std::atomic<uint64_t> flip_age_max_ns{0};
+inline std::atomic<uint64_t> flip_age_count{0};
 /// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
 /// flip_count, in step with the draws the command processor is processing.
 inline std::atomic<uint64_t> cp_frame{0};
@@ -850,6 +878,29 @@ struct FrameTimer {
         }
     }
 };
+
+/// sotc: SOTC_TICKWATCH=1 -- a watcher thread on the draw scheduler samples its timeline
+/// semaphore (vk_scheduler.cpp StartTickWatch); submits and GPU progress land in this ring and
+/// the FLIPGAP detector (videoout/driver.cpp) prints what the timeline did during a gap.
+/// Diagnostic: off by default, never on in benchmarks.
+inline const bool kTickWatch = [] {
+    const char* v = std::getenv("SOTC_TICKWATCH");
+    return v && v[0] == '1';
+}();
+struct TickEvent {
+    int64_t t_ns;  ///< steady_clock time_since_epoch (NowNs)
+    uint64_t gpu;  ///< kind 0: known GPU tick; kind 1/2: the tick submitted
+    uint64_t sub;  ///< kind 0: newest submitted tick; kind 1: (wait semas << 8) | cmd buffers;
+                   ///< kind 2: (submit_mutex wait us << 32) | vkQueueSubmit us
+    uint32_t kind; ///< 0 progress sample, 1 SubmitExecution, 2 put on the Vulkan queue
+};
+inline constexpr size_t kTickRing = 8192;
+inline TickEvent tick_ring[kTickRing];
+inline std::atomic<uint64_t> tick_ring_head{0};
+inline void PushTick(uint32_t kind, uint64_t gpu, uint64_t sub) {
+    const uint64_t i = tick_ring_head.fetch_add(1, std::memory_order_relaxed);
+    tick_ring[i % kTickRing] = {static_cast<int64_t>(NowNs()), gpu, sub, kind};
+}
 
 /// sotc: SOTC_STALL_LOG[=<ms>] (default 40 ms): diagnostic of slow frames (driver.cpp Flip). The sites that
 /// can stall the frame (buffer uploads, arena/staging allocations, texture uploads, fence waits,

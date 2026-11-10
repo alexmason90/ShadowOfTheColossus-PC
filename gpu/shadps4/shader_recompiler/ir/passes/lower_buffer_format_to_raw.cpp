@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "common/logging/log.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -197,31 +198,33 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
     const auto buffer{desc.GetSharp(info)};
 
     const auto is_inst_typed = flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
-    // sotc: fail with the shader identity on 10_11_11 formats that have no conversion.
+    // sotc: 10_11_11 formats that have no conversion come from sharps the game has not written
+    // yet (AmdGpu::IsUnconvertible10_11_11): lowered like a null sharp below, with the shader identity.
     const auto requested_data_format =
         is_inst_typed ? flags.inst_data_fmt.Value() : AmdGpu::DataFormat(buffer.data_format);
     const auto requested_number_format =
         is_inst_typed ? flags.inst_num_fmt.Value() : AmdGpu::NumberFormat(buffer.num_format);
-    if (AmdGpu::RemapDataFormat(requested_data_format) == AmdGpu::DataFormat::Format10_11_11 &&
-        !AmdGpu::IsSupported10_11_11NumberFormat(requested_number_format)) {
-        UNREACHABLE_MSG(
-            "Unsupported PS4 10_11_11 numeric format: shader={:#x} hw_stage={} sw_stage={} "
-            "pc={:#x} instruction_typed={} requested_data_fmt={} requested_num_fmt={} "
-            "descriptor_data_fmt={} descriptor_num_fmt={}",
-            info.pgm_hash, u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc), is_inst_typed,
-            u32(requested_data_format), u32(requested_number_format), buffer.data_format,
-            buffer.num_format);
-    }
-    if (IsBufferFormatStore(inst) &&
-        AmdGpu::RemapDataFormat(requested_data_format) == AmdGpu::DataFormat::Format10_11_11 &&
-        !AmdGpu::IsWritable10_11_11NumberFormat(requested_number_format)) {
-        UNREACHABLE_MSG(
-            "Unsupported PS4 10_11_11 store numeric format: shader={:#x} hw_stage={} "
-            "sw_stage={} pc={:#x} instruction_typed={} requested_data_fmt={} "
-            "requested_num_fmt={} descriptor_data_fmt={} descriptor_num_fmt={}",
-            info.pgm_hash, u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc), is_inst_typed,
-            u32(requested_data_format), u32(requested_number_format), buffer.data_format,
-            buffer.num_format);
+    if (AmdGpu::IsUnconvertible10_11_11(requested_data_format, requested_number_format,
+                                        IsBufferFormatStore(inst))) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Recompiler,
+                        "Unconvertible PS4 10_11_11 {} (sharp not written yet?), lowered as a null "
+                        "sharp: shader={:#x} hw_stage={} sw_stage={} pc={:#x} instruction_typed={} "
+                        "requested_data_fmt={} requested_num_fmt={} descriptor_data_fmt={} "
+                        "descriptor_num_fmt={}",
+                        IsBufferFormatStore(inst) ? "store" : "load", info.pgm_hash,
+                        u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc), is_inst_typed,
+                        u32(requested_data_format), u32(requested_number_format),
+                        buffer.data_format, buffer.num_format);
+        }
+        if (IsBufferFormatLoad(inst)) {
+            inst.ReplaceUsesWithAndRemove(
+                ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
+        } else {
+            inst.Invalidate();
+        }
+        return;
     }
     if (requested_number_format == AmdGpu::NumberFormat::SnormNz &&
         requested_data_format != AmdGpu::DataFormat::Format8 &&

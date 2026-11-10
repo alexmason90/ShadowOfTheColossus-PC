@@ -368,6 +368,7 @@ private:
     /// as reads after the draw so later writes to the same ranges wait for it.
     std::vector<BoundBuffer> fixed_function_reads;
 
+
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
@@ -499,6 +500,9 @@ private:
     bool needs_barrier{};
     /// sotc: SOTC_DEPTH_RO. The depth buffer of this draw is sampled (depth aspect) while its
     /// stencil is written: one layout serves both.
+    bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
+                                  const VideoCore::TextureCache::ImageDesc& desc,
+                                  bool compute) const;
     bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
                                   const VideoCore::ImageViewInfo& view_info) const;
     bool bind_stage_compute{}; ///< the stage BindTextures is binding is a compute shader

@@ -243,6 +243,21 @@ constexpr DataFormat RemapDataFormat(const DataFormat format) {
     }
 }
 
+/// sotc: a 10_11_11 typed buffer access with a number format the recompiler cannot convert
+/// (SnormNz and the like, or a scaled store). No valid sharp has one: it is read from memory the
+/// game has not filled yet, which a cold shader cache translates early (upstream 15be997 for the
+/// same garbage in MapNumberConversion). The access is lowered like a null buffer sharp (loads read
+/// zero, stores are dropped) instead of ending the game; the format is in the specialization key,
+/// so a valid sharp later gets its own translation.
+constexpr bool IsUnconvertible10_11_11(const DataFormat data_fmt, const NumberFormat num_fmt,
+                                       const bool store) noexcept {
+    if (RemapDataFormat(data_fmt) != DataFormat::Format10_11_11) {
+        return false;
+    }
+    return !IsSupported10_11_11NumberFormat(num_fmt) ||
+           (store && !IsWritable10_11_11NumberFormat(num_fmt));
+}
+
 constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFormat data_format) {
     switch (format) {
     case NumberFormat::Unorm: {
@@ -390,7 +405,9 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // sotc: a sharp read from memory the game has not filled yet (a cold shader cache
+            // translates shaders early) can hold any format: it must not end the game.
+            return NumberConversion::None;
         }
     }
     default:
