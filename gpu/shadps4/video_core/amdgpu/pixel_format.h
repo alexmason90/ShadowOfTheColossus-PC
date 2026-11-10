@@ -246,8 +246,8 @@ constexpr DataFormat RemapDataFormat(const DataFormat format) {
 /// sotc: whether the shader recompiler can lower a typed buffer access with this (already
 /// remapped) data/number format pair: the pairs IREmitter's Pack/Unpack helpers and the 32-bit
 /// path implement. Any other pair comes from a sharp the game has not written yet (a cold shader
-/// cache translates shaders early: SnormNz with 10_11_11, Float with 8_8_8_8, ...); it is lowered
-/// like a null sharp instead of reaching an UNREACHABLE (upstream 15be997 for MapNumberConversion).
+/// cache translates shaders early: SnormNz with 10_11_11, Float with 8_8_8_8, ...). A worker hands
+/// it back; the command processor's own translation lowers it as a null sharp (upstream 15be997).
 constexpr bool IsLowerableBufferFormat(const DataFormat data_fmt,
                                        const NumberFormat num_fmt) noexcept {
     const bool integer_or_norm = num_fmt == NumberFormat::Unorm || num_fmt == NumberFormat::Snorm ||

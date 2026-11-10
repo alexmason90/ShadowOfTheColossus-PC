@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include "common/assert_scope.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -206,6 +207,11 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
         is_inst_typed ? flags.inst_num_fmt.Value() : AmdGpu::NumberFormat(buffer.num_format);
     if (AmdGpu::IsUnconvertible10_11_11(requested_data_format, requested_number_format,
                                         IsBufferFormatStore(inst))) {
+        if (Common::g_assert_throws) {
+            // A pipeline worker read a table the game may have reused: hand the shader back to
+            // the command processor, which translates it from the draw's own data.
+            throw Common::AssertFailure{};
+        }
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
             LOG_WARNING(Render_Recompiler,
@@ -271,6 +277,11 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
     // sotc: a pair the emitter cannot lower (AmdGpu::IsLowerableBufferFormat) is a sharp the game
     // has not written yet: lowered as a null sharp too, instead of an UNREACHABLE in Pack/Unpack.
     if (!AmdGpu::IsLowerableBufferFormat(data_format, format_info.num_format)) {
+        if (Common::g_assert_throws) {
+            // A pipeline worker read a table the game may have reused: hand the shader back to
+            // the command processor, which translates it from the draw's own data.
+            throw Common::AssertFailure{};
+        }
         static std::atomic<u32> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
             LOG_WARNING(Render_Recompiler,
