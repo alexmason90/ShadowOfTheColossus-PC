@@ -268,6 +268,28 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
         return;
     }
 
+    // sotc: a pair the emitter cannot lower (AmdGpu::IsLowerableBufferFormat) is a sharp the game
+    // has not written yet: lowered as a null sharp too, instead of an UNREACHABLE in Pack/Unpack.
+    if (!AmdGpu::IsLowerableBufferFormat(data_format, format_info.num_format)) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Recompiler,
+                        "Unlowerable buffer format (sharp not written yet?), lowered as a null "
+                        "sharp: shader={:#x} hw_stage={} sw_stage={} pc={:#x} typed={} data_fmt={} "
+                        "num_fmt={} descriptor_data_fmt={} descriptor_num_fmt={}",
+                        info.pgm_hash, u32(info.hw_stage), u32(info.sw_stage), u32(flags.pc),
+                        is_inst_typed, u32(data_format), u32(format_info.num_format),
+                        buffer.data_format, buffer.num_format);
+        }
+        if (IsBufferFormatLoad(inst)) {
+            inst.ReplaceUsesWithAndRemove(
+                ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
+        } else {
+            inst.Invalidate();
+        }
+        return;
+    }
+
     if (IsBufferFormatLoad(inst)) {
         if ((data_format == AmdGpu::DataFormat::Format32 ||
              data_format == AmdGpu::DataFormat::Format32_32 ||

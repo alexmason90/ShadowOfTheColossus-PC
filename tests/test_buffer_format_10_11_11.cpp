@@ -458,6 +458,27 @@ int main(int argc, char** argv) {
         CHECK(!AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, format, false));
         CHECK(!AmdGpu::IsUnconvertible10_11_11(DataFormat::Format10_11_11, format, true));
     }
+    // Every pair the emitter implements is lowerable; garbage pairs are not (lowered as null).
+    for (const auto format : {NumberFormat::Unorm, NumberFormat::Snorm, NumberFormat::Uint,
+                              NumberFormat::Sint}) {
+        for (const auto data : {DataFormat::Format8, DataFormat::Format8_8, DataFormat::Format8_8_8_8,
+                                DataFormat::Format16, DataFormat::Format16_16,
+                                DataFormat::Format16_16_16_16, DataFormat::Format10_11_11,
+                                DataFormat::Format2_10_10_10}) {
+            CHECK(AmdGpu::IsLowerableBufferFormat(data, format));
+        }
+    }
+    for (const auto data : {DataFormat::Format16, DataFormat::Format16_16,
+                            DataFormat::Format16_16_16_16, DataFormat::Format10_11_11,
+                            DataFormat::Format32, DataFormat::Format32_32,
+                            DataFormat::Format32_32_32, DataFormat::Format32_32_32_32}) {
+        CHECK(AmdGpu::IsLowerableBufferFormat(data, NumberFormat::Float));
+    }
+    CHECK(!AmdGpu::IsLowerableBufferFormat(DataFormat::Format8_8_8_8, NumberFormat::Float));
+    CHECK(!AmdGpu::IsLowerableBufferFormat(DataFormat::Format2_10_10_10, NumberFormat::Float));
+    CHECK(!AmdGpu::IsLowerableBufferFormat(DataFormat::Format32, NumberFormat::Unorm));
+    CHECK(!AmdGpu::IsLowerableBufferFormat(DataFormat::Format10_11_11, NumberFormat::SnormNz));
+    CHECK(!AmdGpu::IsLowerableBufferFormat(DataFormat::Format5_6_5, NumberFormat::Unorm));
     // Other data formats are not this check's business.
     CHECK(!AmdGpu::IsUnconvertible10_11_11(DataFormat::Format8_8_8_8, NumberFormat::SnormNz, false));
     CHECK(AmdGpu::RemapNumberFormat(NumberFormat::Uscaled, AmdGpu::DataFormat::Format10_11_11) ==

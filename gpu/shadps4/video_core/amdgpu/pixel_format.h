@@ -243,6 +243,37 @@ constexpr DataFormat RemapDataFormat(const DataFormat format) {
     }
 }
 
+/// sotc: whether the shader recompiler can lower a typed buffer access with this (already
+/// remapped) data/number format pair: the pairs IREmitter's Pack/Unpack helpers and the 32-bit
+/// path implement. Any other pair comes from a sharp the game has not written yet (a cold shader
+/// cache translates shaders early: SnormNz with 10_11_11, Float with 8_8_8_8, ...); it is lowered
+/// like a null sharp instead of reaching an UNREACHABLE (upstream 15be997 for MapNumberConversion).
+constexpr bool IsLowerableBufferFormat(const DataFormat data_fmt,
+                                       const NumberFormat num_fmt) noexcept {
+    const bool integer_or_norm = num_fmt == NumberFormat::Unorm || num_fmt == NumberFormat::Snorm ||
+                                 num_fmt == NumberFormat::Uint || num_fmt == NumberFormat::Sint;
+    switch (data_fmt) {
+    case DataFormat::Format8:
+    case DataFormat::Format8_8:
+    case DataFormat::Format8_8_8_8:
+    case DataFormat::Format2_10_10_10:
+        return integer_or_norm;
+    case DataFormat::Format16:
+    case DataFormat::Format16_16:
+    case DataFormat::Format16_16_16_16:
+    case DataFormat::Format10_11_11:
+        return integer_or_norm || num_fmt == NumberFormat::Float;
+    case DataFormat::Format32:
+    case DataFormat::Format32_32:
+    case DataFormat::Format32_32_32:
+    case DataFormat::Format32_32_32_32:
+        return num_fmt == NumberFormat::Uint || num_fmt == NumberFormat::Sint ||
+               num_fmt == NumberFormat::Float;
+    default:
+        return false;
+    }
+}
+
 /// sotc: a 10_11_11 typed buffer access with a number format the recompiler cannot convert
 /// (SnormNz and the like, or a scaled store). No valid sharp has one: it is read from memory the
 /// game has not filled yet, which a cold shader cache translates early (upstream 15be997 for the
